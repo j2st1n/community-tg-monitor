@@ -1,6 +1,7 @@
 services:
   nodeseek-monitor:
-    build: .
+    image: ghcr.io/j2st1n/nodeseek-tg-monitor:latest
+    # build: .  # 如需本地编译可取消此行注释并注释上一行
     container_name: nodeseek-monitor
     restart: unless-stopped
     env_file:

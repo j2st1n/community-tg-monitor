@@ -14,7 +14,7 @@
 - 🏷️ **优雅分类胶囊流**：关键词分类聚合展示（🎲 抽奖活动 / 🧧 福利赠送 / 🏷️ 自定义关注词），告别传统死板的纵向列表。
 - 🔗 **清晰直达链接**：推送卡片直接展示完整明文 HTTP/HTTPS 链接，点击直达论坛回帖参与。
 - 🚫 **智能降噪过滤**：内置负向屏蔽机制，自动过滤买卖求购帖（如 `【慢收】`、`求购`）。
-- 🐳 **Docker 极简开箱即用**：基于 `python:3.12-alpine` 构建，镜像体积小于 40MB，内存占用仅 20MB。
+- 🐳 **多架构 Docker 镜像支持**：自动构建发布至 GitHub Container Registry（`linux/amd64` 与 `linux/arm64`），体积仅 30MB，内存占用仅 20MB。
 
 ---
 
@@ -32,45 +32,66 @@
 
 ---
 
-## 🚀 快速开始 (Docker Compose)
+## 🚀 极速部署
 
-### 1. 克隆仓库与配置
+### 方式一：Docker Compose（推荐）
+
+#### 1. 创建目录与配置文件
 ```bash
-git clone https://github.com/j2st1n/nodeseek-tg-monitor.git
-cd nodeseek-tg-monitor
+mkdir -p nodeseek-monitor && cd nodeseek-monitor
 
-# 复制环境变量模板
-cp .env.example .env
-```
-
-### 2. 配置 Telegram 凭据
-编辑 `.env` 文件：
-```ini
+# 创建配置文件 .env
+cat << 'ENV_EOF' > .env
 TG_BOT_TOKEN=你的_TELEGRAM_BOT_TOKEN
 TG_CHAT_ID=你的_TELEGRAM_CHAT_ID
-```
-> 💡 **获取方式**：
-> * `TG_BOT_TOKEN`：在 Telegram 联系 [@BotFather](https://t.me/BotFather) 发送 `/newbot` 获取。
-> * `TG_CHAT_ID`：在 Telegram 联系 [@userinfobot](https://t.me/userinfobot) 获取你的数字 ID。
+ENV_EOF
 
-### 3. 一键启动
-```bash
-docker compose up -d --build
+# 创建 docker-compose.yml
+cat << 'COMPOSE_EOF' > docker-compose.yml
+services:
+  nodeseek-monitor:
+    image: ghcr.io/j2st1n/nodeseek-tg-monitor:latest
+    container_name: nodeseek-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+COMPOSE_EOF
 ```
 
-### 4. 查看运行日志
+#### 2. 一键启动
 ```bash
-docker compose logs -f
+docker compose up -d
 ```
 
 ---
 
-## 📦 本地免 Docker 运行
-
-如果你不想使用 Docker，也可以直接在宿主机运行：
+### 方式二：单行 Docker Run 极速运行
 
 ```bash
-# 设置环境变量并后台启动
+docker run -d \
+  --name nodeseek-monitor \
+  --restart unless-stopped \
+  -e TG_BOT_TOKEN="你的_BOT_TOKEN" \
+  -e TG_CHAT_ID="你的_CHAT_ID" \
+  -v $(pwd)/data:/app/data \
+  ghcr.io/j2st1n/nodeseek-tg-monitor:latest
+```
+
+---
+
+### 方式三：本地免 Docker 原生运行
+
+```bash
+git clone https://github.com/j2st1n/nodeseek-tg-monitor.git
+cd nodeseek-tg-monitor
+
 export TG_BOT_TOKEN="你的_BOT_TOKEN"
 export TG_CHAT_ID="你的_CHAT_ID"
 export DATA_DIR="./data"

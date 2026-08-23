@@ -16,9 +16,11 @@ SEEN_IDS_FILE = os.path.join(DATA_DIR, "seen_ids.json")
 RSS_URL = "https://rss.nodeseek.com/"
 DEFAULT_POLL_INTERVAL = 30
 
+# 默认关键词库（涵盖各种抽奖与赠送形态）
 DEFAULT_KEYWORDS = [
     "抽奖", "抽", "福利", "roll", "Roll", "ROLL",
-    "送个", "送台", "口令", "红包", "开奖", "盖楼", "中奖", "白嫖", "免费送"
+    "送", "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得",
+    "口令", "红包", "开奖", "盖楼", "中奖", "白嫖", "免费送"
 ]
 
 DEFAULT_BLOCKWORDS = ["收", "求", "买", "询"]
@@ -33,9 +35,8 @@ BOT_COMMANDS = [
     {"command": "help", "description": "📖 显示帮助菜单"}
 ]
 
-# 预设分类词库（用于优雅分组展示）
 BUILTIN_LOTTERY = {"抽奖", "抽", "开奖", "中奖", "roll", "Roll", "ROLL", "盖楼"}
-BUILTIN_WELFARE = {"福利", "送个", "送台", "免费送", "白嫖", "口令", "红包"}
+BUILTIN_WELFARE = {"福利", "送", "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "白嫖", "口令", "红包"}
 
 class BotManager:
     def __init__(self):
@@ -198,7 +199,6 @@ class BotManager:
         return False
 
     def format_keywords_card(self):
-        """结构化优雅展示关键词卡片"""
         with self.lock:
             kws = list(self.keywords)
         
@@ -234,7 +234,6 @@ class BotManager:
         return text, markup
 
     def format_blocks_card(self):
-        """结构化优雅展示屏蔽词卡片"""
         with self.lock:
             bws = list(self.blockwords)
         
@@ -260,7 +259,6 @@ class BotManager:
         return text, markup
 
 def make_keyword_buttons(keywords, prefix="del_kw"):
-    """生成网格删除按钮"""
     keyboard = []
     row = []
     for kw in keywords:
@@ -274,7 +272,6 @@ def make_keyword_buttons(keywords, prefix="del_kw"):
     keyboard.append([{"text": "🔙 返回关键词列表", "callback_data": f"{prefix}:__back__"}])
     return {"inline_keyboard": keyboard}
 
-# ----------------- TG 按钮点击事件处理 -----------------
 def handle_callback_query(bot, query):
     query_id = query["id"]
     from_user = str(query.get("from", {}).get("id", ""))
@@ -365,7 +362,6 @@ def handle_callback_query(bot, query):
                 text, markup = bot.format_blocks_card()
                 bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
 
-# ----------------- TG 文本指令处理 -----------------
 def handle_command_or_text(bot, chat_id, text):
     text = text.strip()
 
@@ -443,7 +439,6 @@ def handle_command_or_text(bot, chat_id, text):
 
     elif cmd in ["/keywords", "/list", "/add", "/del"]:
         if cmd == "/add" and arg:
-            # 兼容老指令
             new_kws = arg.split()
             added = []
             with bot.lock:
@@ -456,7 +451,6 @@ def handle_command_or_text(bot, chat_id, text):
             bot.send_msg(chat_id, f"✅ 已添加：<code>{', '.join(added)}</code>\n\n{text_card}", reply_markup=markup)
             return
         
-        # 优雅卡片展示 + 快捷管理按钮
         text_card, markup = bot.format_keywords_card()
         bot.send_msg(chat_id, text_card, reply_markup=markup)
 
@@ -498,7 +492,6 @@ def handle_command_or_text(bot, chat_id, text):
     else:
         bot.send_msg(chat_id, f"❓ 未识别的指令：<code>{cmd}</code>\n请输入 /help 查看可用指令列表。")
 
-# ----------------- TG 消息长轮询线程 -----------------
 def telegram_polling_thread(bot):
     offset = 0
     print(f"[{datetime.now()}] 🤖 Telegram 交互指令与按钮监听器已启动...", flush=True)
@@ -535,7 +528,6 @@ def telegram_polling_thread(bot):
         except Exception as e:
             time.sleep(1)
 
-# ----------------- RSS 监控主线程 -----------------
 def fetch_rss():
     req = urllib.request.Request(
         RSS_URL,
@@ -585,7 +577,7 @@ def rss_monitor_thread(bot):
 
                         if not bot.paused and bot.is_match(title, desc):
                             bot.total_hit += 1
-                            print(f"[{datetime.now()}] 🎁 命中抽奖贴: [{cat}] {title} (作者: {author})", flush=True)
+                            print(f"[{datetime.now()}] 🎁 命中抽奖/福利贴: [{cat}] {title} (作者: {author})", flush=True)
                             msg = (
                                 f"🎁 <b>NodeSeek 发现抽奖/福利新帖！</b>\n\n"
                                 f"📌 <b>标题</b>: {title}\n"

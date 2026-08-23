@@ -1,0 +1,6 @@
+.env
+data/settings.json
+data/seen_ids.json
+*.log
+__pycache__/
+.DS_Store

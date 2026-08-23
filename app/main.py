@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import json
+import re
 import threading
 import urllib.request
 import urllib.parse
@@ -16,14 +17,14 @@ SEEN_IDS_FILE = os.path.join(DATA_DIR, "seen_ids.json")
 RSS_URL = "https://rss.nodeseek.com/"
 DEFAULT_POLL_INTERVAL = 30
 
-# 默认关键词库（涵盖各种抽奖与赠送形态）
+# 默认关键词库（精准组合，避免单字误伤）
 DEFAULT_KEYWORDS = [
     "抽奖", "抽", "福利", "roll", "Roll", "ROLL",
-    "送", "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得",
-    "口令", "红包", "开奖", "盖楼", "中奖", "白嫖", "免费送"
+    "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "送小鸡", "送机器", "送码",
+    "口令", "红包", "开奖", "盖楼", "中奖", "白嫖"
 ]
 
-DEFAULT_BLOCKWORDS = ["收", "求", "买", "询"]
+DEFAULT_BLOCKWORDS = ["收", "求", "买", "询", "出", "出出", "出台", "出个", "出只"]
 
 BOT_COMMANDS = [
     {"command": "status", "description": "📊 监控状态与运行统计"},
@@ -36,7 +37,11 @@ BOT_COMMANDS = [
 ]
 
 BUILTIN_LOTTERY = {"抽奖", "抽", "开奖", "中奖", "roll", "Roll", "ROLL", "盖楼"}
-BUILTIN_WELFARE = {"福利", "送", "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "白嫖", "口令", "红包"}
+BUILTIN_WELFARE = {"福利", "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "白嫖", "口令", "红包", "送小鸡", "送机器", "送码"}
+
+def clean_title_prefix(title):
+    """去除标题开头的括号和特殊标点符号，如 '【出】' -> '出】'"""
+    return re.sub(r'^[【\[\(（\s]+', '', title)
 
 class BotManager:
     def __init__(self):
@@ -189,12 +194,24 @@ class BotManager:
             return False
 
     def is_match(self, title, desc):
+        clean_t = clean_title_prefix(title)
         with self.lock:
+            # 1. 屏蔽词前缀与内容过滤（自动支持 【出】、【收】 等）
             for bw in self.blockwords:
-                if bw and (bw in title or title.startswith(bw)):
-                    return False
+                if bw:
+                    if clean_t.startswith(bw) or title.startswith(bw):
+                        return False
+
+            # 2. 标题赠送语法直通（如 '送只小鸡', '送一台' 等以送开头的帖子）
+            if clean_t.startswith("送") and not clean_t.startswith("送中"):
+                return True
+
+            # 3. 清理正文中的常见网络术语干扰（如 '送中', '没送中', '未送中', '推送' 等）
+            clean_desc = desc.replace("送中", "").replace("没送中", "").replace("未送中", "").replace("推送", "").replace("发送", "")
+
+            # 4. 关键词扫描
             for kw in self.keywords:
-                if kw and (kw in title or kw in desc):
+                if kw and (kw in title or kw in clean_desc):
                     return True
         return False
 
@@ -246,7 +263,7 @@ class BotManager:
         text = (
             f"🛡️ <b>NodeSeek 噪音过滤屏蔽库</b>\n\n"
             f"{body}\n\n"
-            "<i>💡 标题包含以上词汇或前缀的帖子将自动忽略，不予推送</i>"
+            "<i>💡 标题包含以上词汇或以其为前缀（如 【出】、【收】）的帖子将自动忽略</i>"
         )
         markup = {
             "inline_keyboard": [
@@ -269,7 +286,7 @@ def make_keyword_buttons(keywords, prefix="del_kw"):
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([{"text": "🔙 返回关键词列表", "callback_data": f"{prefix}:__back__"}])
+    keyboard.append([{"text": "🔙 返回列表", "callback_data": f"{prefix}:__back__"}])
     return {"inline_keyboard": keyboard}
 
 def handle_callback_query(bot, query):
@@ -304,7 +321,7 @@ def handle_callback_query(bot, query):
     elif data == "menu:add_bw":
         bot.user_states[chat_id] = "waiting_for_block"
         bot.answer_callback_query(query_id, "请直接输入新屏蔽词")
-        bot.send_msg(chat_id, "⛔ <b>请输入你想添加的屏蔽词：</b>\n<i>（例如输入：<code>慢收 求购</code>）</i>")
+        bot.send_msg(chat_id, "⛔ <b>请输入你想添加的屏蔽词：</b>\n<i>（例如输入：<code>慢收 求购 出</code>）</i>")
 
     elif data == "menu:del_bw":
         bot.answer_callback_query(query_id, "请点击按钮解除")
@@ -603,7 +620,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 NodeSeek Monitor v2.2 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 NodeSeek Monitor v2.3 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

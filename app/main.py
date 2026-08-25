@@ -14,7 +14,24 @@ DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 SEEN_IDS_FILE = os.path.join(DATA_DIR, "seen_ids.json")
 
-RSS_URL = "https://rss.nodeseek.com/"
+# 内置多源配置
+DEFAULT_SOURCES = [
+    {
+        "id": "nodeseek",
+        "name": "NodeSeek",
+        "icon": "🌐",
+        "url": "https://rss.nodeseek.com/",
+        "author_tag": "{http://purl.org/dc/elements/1.1/}creator",
+    },
+    {
+        "id": "sbsb",
+        "name": "烧饼论坛",
+        "icon": "🍪",
+        "url": "https://sb.sb/rss.xml",
+        "author_tag": None,
+    }
+]
+
 DEFAULT_POLL_INTERVAL = 30
 
 # 默认关键词库（精准组合，避免单字误伤）
@@ -41,7 +58,7 @@ BUILTIN_WELFARE = {"福利", "送只", "送个", "送台", "送一", "白送", "
 
 def clean_title_prefix(title):
     """去除标题开头的括号和特殊标点符号，如 '【出】' -> '出】'"""
-    return re.sub(r'^[【\[\(（\s]+', '', title)
+    return re.sub(r'^[【\[\(（〖\s]+', '', title)
 
 class BotManager:
     def __init__(self):
@@ -55,6 +72,17 @@ class BotManager:
         
         self.user_states = {}
         
+        self.sources = list(DEFAULT_SOURCES)
+        
+        # 支持通过环境变量过滤启用的源
+        enabled_source_ids = os.environ.get("MONITOR_SOURCES", "").strip().lower()
+        if enabled_source_ids:
+            allowed = [s.strip() for s in enabled_source_ids.split(",") if s.strip()]
+            self.sources = [s for s in self.sources if s["id"] in allowed]
+            if not self.sources:
+                print(f"[{datetime.now()}] ⚠️ 环境变量 MONITOR_SOURCES 过滤后无有效源，恢复默认全源。", flush=True)
+                self.sources = list(DEFAULT_SOURCES)
+        
         self.load_settings()
         self.seen_ids = self.load_seen_ids()
         self.register_telegram_commands()
@@ -66,7 +94,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "NodeSeek-Bot/2.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.0"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -119,7 +147,7 @@ class BotManager:
         return set()
 
     def save_seen_ids(self):
-        id_list = list(self.seen_ids)[-500:]
+        id_list = list(self.seen_ids)[-1000:]
         with open(SEEN_IDS_FILE, "w", encoding="utf-8") as f:
             json.dump(id_list, f, ensure_ascii=False)
 
@@ -138,7 +166,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "NodeSeek-Bot/2.0"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.0"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -169,7 +197,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "NodeSeek-Bot/2.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.0"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -185,7 +213,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "NodeSeek-Bot/2.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.0"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -236,7 +264,7 @@ class BotManager:
 
         body = "\n\n".join(sections) if sections else "<i>（暂无关键词，请点击下方添加）</i>"
         text = (
-            f"🎯 <b>NodeSeek 监控关键词库</b> (共 {len(kws)} 个)\n\n"
+            f"🎯 <b>社区监控关键词库</b> (共 {len(kws)} 个)\n\n"
             f"{body}\n\n"
             "<i>💡 命中以上任意词的新帖都会即时推送提醒</i>"
         )
@@ -261,7 +289,7 @@ class BotManager:
             body = "<i>（当前无屏蔽词）</i>"
 
         text = (
-            f"🛡️ <b>NodeSeek 噪音过滤屏蔽库</b>\n\n"
+            f"🛡️ <b>噪音过滤屏蔽库</b>\n\n"
             f"{body}\n\n"
             "<i>💡 标题包含以上词汇或以其为前缀（如 【出】、【收】）的帖子将自动忽略</i>"
         )
@@ -424,8 +452,10 @@ def handle_command_or_text(bot, chat_id, text):
     print(f"[{datetime.now()}] 📨 处理指令: '{text}'", flush=True)
 
     if cmd in ["/start", "/help"]:
+        sources_desc = "、".join([f"{s['icon']} {s['name']}" for s in bot.sources])
         help_text = (
-            "🤖 <b>NodeSeek 抽奖与热帖监控 Bot 指令中心</b>\n\n"
+            f"🤖 <b>多社区抽奖与热帖监控 Bot 指令中心</b>\n\n"
+            f"📡 <b>当前监控源</b>: {sources_desc}\n\n"
             "📊 <b>状态与词库</b>\n"
             "├ /status - 监控运行统计与健康报告\n"
             "├ /keywords - 🎯 <b>查看并交互式管理监控关键词</b>\n"
@@ -441,11 +471,13 @@ def handle_command_or_text(bot, chat_id, text):
         uptime = datetime.now() - bot.start_time
         hours, remainder = divmod(int(uptime.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
+        sources_list = "\n".join([f"  • {s['icon']} <b>{s['name']}</b> ({s['url']})" for s in bot.sources])
         status_text = (
-            "📊 <b>NodeSeek 监控守护状态报告</b>\n\n"
+            "📊 <b>社区监控守护状态报告</b>\n\n"
             f"⏱️ <b>运行时间</b>: {hours}小时 {minutes}分 {seconds}秒\n"
             f"🔔 <b>推送状态</b>: {'⏸️ 已暂停' if bot.paused else '▶️ 运行中'}\n"
             f"📡 <b>轮询周期</b>: 每 {bot.poll_interval} 秒\n"
+            f"🌐 <b>已启用监控源 ({len(bot.sources)})</b>:\n{sources_list}\n"
             f"🎯 <b>监控关键词数</b>: {len(bot.keywords)} 个\n"
             f"🚫 <b>屏蔽词数</b>: {len(bot.blockwords)} 个\n"
             f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇帖子\n"
@@ -497,14 +529,22 @@ def handle_command_or_text(bot, chat_id, text):
         bot.send_msg(chat_id, "▶️ <b>监控推送已恢复正常运行！</b>")
 
     elif cmd == "/test":
-        test_msg = (
-            "🎁 <b>NodeSeek 发现抽奖/福利新帖！</b> (手动测试)\n\n"
+        test_msg_ns = (
+            "🎁 <b>🌐 [NodeSeek] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
             "📌 <b>标题</b>: [日常] 测试抽奖演示贴\n"
             "👤 <b>作者</b>: NodeSeeker  |  🏷️ <b>板块</b>: #daily\n"
-            "📝 <b>摘要</b>: 这是一条手动触发的测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
+            "📝 <b>摘要</b>: 这是一条手动触发的 NodeSeek 测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
             "🔗 <b>链接</b>: https://www.nodeseek.com/post-889000-1"
         )
-        bot.send_msg(chat_id, test_msg, disable_preview=False)
+        test_msg_sb = (
+            "🎁 <b>🍪 [烧饼论坛] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
+            "📌 <b>标题</b>: 〖抽奖〗新人见面礼｜抽 10 台 LAXPre Nano，65 折循环续费\n"
+            "👤 <b>作者</b>: 烧饼用户  |  🏷️ <b>板块</b>: #优惠\n"
+            "📝 <b>摘要</b>: 这是一条手动触发的烧饼论坛测试卡片，抽奖专区与全站流已全部接入监控。\n\n"
+            "🔗 <b>链接</b>: https://sb.sb/t/931/"
+        )
+        bot.send_msg(chat_id, test_msg_ns, disable_preview=False)
+        bot.send_msg(chat_id, test_msg_sb, disable_preview=False)
     
     else:
         bot.send_msg(chat_id, f"❓ 未识别的指令：<code>{cmd}</code>\n请输入 /help 查看可用指令列表。")
@@ -515,7 +555,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "NodeSeek-Bot/2.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.0"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -545,69 +585,94 @@ def telegram_polling_thread(bot):
         except Exception as e:
             time.sleep(1)
 
-def fetch_rss():
+def fetch_rss(url):
     req = urllib.request.Request(
-        RSS_URL,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.0)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return ET.fromstring(resp.read().decode("utf-8"))
     except Exception as e:
-        print(f"[{datetime.now()}] RSS 拉取异常: {e}", flush=True)
+        print(f"[{datetime.now()}] RSS 拉取异常 ({url}): {e}", flush=True)
         return None
 
 def rss_monitor_thread(bot):
-    print(f"[{datetime.now()}] 📡 NodeSeek RSS 监控引擎已就绪...", flush=True)
+    print(f"[{datetime.now()}] 📡 多社区 RSS 监控引擎已就绪 (共 {len(bot.sources)} 个源)...", flush=True)
     first_run = len(bot.seen_ids) == 0
 
     while True:
         try:
-            root = fetch_rss()
-            if root is not None:
+            for source in bot.sources:
+                source_id = source["id"]
+                source_name = source["name"]
+                source_icon = source["icon"]
+                source_url = source["url"]
+                author_tag = source.get("author_tag")
+
+                root = fetch_rss(source_url)
+                if root is None:
+                    continue
+
                 channel = root.find("channel")
-                if channel is not None:
-                    items = channel.findall("item")
-                    for item in reversed(items):
-                        guid_elem = item.find("guid")
-                        title_elem = item.find("title")
-                        link_elem = item.find("link")
-                        desc_elem = item.find("description")
-                        creator_elem = item.find("{http://purl.org/dc/elements/1.1/}creator")
-                        category_elem = item.find("category")
+                if channel is None:
+                    continue
 
-                        post_id = guid_elem.text.strip() if guid_elem is not None else ""
-                        title = title_elem.text.strip() if title_elem is not None else ""
-                        link = link_elem.text.strip() if link_elem is not None else ""
-                        desc = desc_elem.text.strip() if desc_elem is not None else ""
-                        author = creator_elem.text.strip() if creator_elem is not None else "未知"
-                        cat = category_elem.text.strip() if category_elem is not None else "其他"
+                items = channel.findall("item")
+                # 倒序遍历（从旧到新），确保新帖按先后顺序入库和推送
+                for item in reversed(items):
+                    guid_elem = item.find("guid")
+                    title_elem = item.find("title")
+                    link_elem = item.find("link")
+                    desc_elem = item.find("description")
+                    category_elem = item.find("category")
 
-                        if not post_id or post_id in bot.seen_ids:
-                            continue
+                    raw_guid = guid_elem.text.strip() if guid_elem is not None and guid_elem.text else ""
+                    link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
+                    title = title_elem.text.strip() if title_elem is not None and title_elem.text else ""
+                    desc = desc_elem.text.strip() if desc_elem is not None and desc_elem.text else ""
+                    cat = category_elem.text.strip() if category_elem is not None and category_elem.text else "综合"
 
-                        bot.seen_ids.add(post_id)
-                        bot.total_checked += 1
+                    # 提取作者
+                    author = "未知"
+                    if author_tag:
+                        creator_elem = item.find(author_tag)
+                        if creator_elem is not None and creator_elem.text:
+                            author = creator_elem.text.strip()
+                    elif source_id == "sbsb":
+                        # 烧饼论坛 RSS 的 author 未单独列出标签时，默认使用站点作者或标识
+                        author = f"烧饼用户"
 
-                        if first_run:
-                            continue
+                    # 全局唯一去重键
+                    unique_id = f"{source_id}:{raw_guid or link}"
+                    if not unique_id or unique_id in bot.seen_ids:
+                        continue
 
-                        if not bot.paused and bot.is_match(title, desc):
-                            bot.total_hit += 1
-                            print(f"[{datetime.now()}] 🎁 命中抽奖/福利贴: [{cat}] {title} (作者: {author})", flush=True)
-                            msg = (
-                                f"🎁 <b>NodeSeek 发现抽奖/福利新帖！</b>\n\n"
-                                f"📌 <b>标题</b>: {title}\n"
-                                f"👤 <b>作者</b>: {author}  |  🏷️ <b>板块</b>: #{cat}\n"
-                                f"📝 <b>摘要</b>: {desc[:120]}{'...' if len(desc) > 120 else ''}\n\n"
-                                f"🔗 <b>链接</b>: {link}"
-                            )
-                            bot.send_msg(bot.admin_chat_id, msg, disable_preview=False)
+                    bot.seen_ids.add(unique_id)
+                    bot.total_checked += 1
 
-                    bot.save_seen_ids()
                     if first_run:
-                        first_run = False
-                        print(f"[{datetime.now()}] ✅ 已初始化历史帖子索引 ({len(bot.seen_ids)} 篇)，开启监听！", flush=True)
+                        continue
+
+                    # 判断是否命中监控条件
+                    if not bot.paused and bot.is_match(title, desc):
+                        bot.total_hit += 1
+                        print(f"[{datetime.now()}] 🎁 命中抽奖/福利贴: [{source_name}] [{cat}] {title} (作者: {author})", flush=True)
+                        
+                        summary = desc[:140] + ("..." if len(desc) > 140 else "")
+                        msg = (
+                            f"🎁 <b>{source_icon} [{source_name}] 发现抽奖/福利新帖！</b>\n\n"
+                            f"📌 <b>标题</b>: {title}\n"
+                            f"👤 <b>作者</b>: {author}  |  🏷️ <b>板块</b>: #{cat}\n"
+                            f"📝 <b>摘要</b>: {summary}\n\n"
+                            f"🔗 <b>链接</b>: {link}"
+                        )
+                        bot.send_msg(bot.admin_chat_id, msg, disable_preview=False)
+
+            bot.save_seen_ids()
+            if first_run:
+                first_run = False
+                print(f"[{datetime.now()}] ✅ 已初始化历史帖子索引 ({len(bot.seen_ids)} 篇)，开启多源实时监听！", flush=True)
 
         except Exception as e:
             print(f"[{datetime.now()}] 监控循环异常: {e}", flush=True)
@@ -620,7 +685,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 NodeSeek Monitor v2.3 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.0 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

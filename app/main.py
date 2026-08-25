@@ -13,6 +13,7 @@ from datetime import datetime
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 SEEN_IDS_FILE = os.path.join(DATA_DIR, "seen_ids.json")
+SEEN_MSGS_FILE = os.path.join(DATA_DIR, "seen_msgs.json")
 
 # 内置多源配置
 DEFAULT_SOURCES = [
@@ -33,6 +34,7 @@ DEFAULT_SOURCES = [
 ]
 
 DEFAULT_POLL_INTERVAL = 30
+DEFAULT_PRIVATE_INTERVAL = 60
 
 # 默认关键词库（精准组合，避免单字误伤）
 DEFAULT_KEYWORDS = [
@@ -64,11 +66,14 @@ class BotManager:
     def __init__(self):
         self.bot_token = os.environ.get("TG_BOT_TOKEN", "").strip()
         self.admin_chat_id = str(os.environ.get("TG_CHAT_ID", "")).strip()
+        self.sbsb_cookie = os.environ.get("SBSB_COOKIE", "").strip()
         self.lock = threading.Lock()
         self.start_time = datetime.now()
         self.paused = False
         self.total_checked = 0
         self.total_hit = 0
+        self.total_private_notified = 0
+        self.last_cookie_warn_time = 0
         
         self.user_states = {}
         
@@ -85,6 +90,7 @@ class BotManager:
         
         self.load_settings()
         self.seen_ids = self.load_seen_ids()
+        self.seen_msgs = self.load_seen_msgs()
         self.register_telegram_commands()
 
     def register_telegram_commands(self):
@@ -94,7 +100,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.1"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -151,6 +157,20 @@ class BotManager:
         with open(SEEN_IDS_FILE, "w", encoding="utf-8") as f:
             json.dump(id_list, f, ensure_ascii=False)
 
+    def load_seen_msgs(self):
+        if os.path.exists(SEEN_MSGS_FILE):
+            try:
+                with open(SEEN_MSGS_FILE, "r", encoding="utf-8") as f:
+                    return set(json.load(f))
+            except Exception:
+                return set()
+        return set()
+
+    def save_seen_msgs(self):
+        id_list = list(self.seen_msgs)[-500:]
+        with open(SEEN_MSGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(id_list, f, ensure_ascii=False)
+
     def send_msg(self, chat_id, text, reply_markup=None, disable_preview=True, retries=2):
         api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {
@@ -166,7 +186,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.0"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.1"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -197,7 +217,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.1"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -213,7 +233,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.1"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -453,9 +473,11 @@ def handle_command_or_text(bot, chat_id, text):
 
     if cmd in ["/start", "/help"]:
         sources_desc = "、".join([f"{s['icon']} {s['name']}" for s in bot.sources])
+        sbsb_private_desc = "🟢 已启用" if bot.sbsb_cookie else "⚪ 未配置 (可选)"
         help_text = (
             f"🤖 <b>多社区抽奖与热帖监控 Bot 指令中心</b>\n\n"
-            f"📡 <b>当前监控源</b>: {sources_desc}\n\n"
+            f"📡 <b>当前公开源</b>: {sources_desc}\n"
+            f"📬 <b>烧饼私信/提醒监听</b>: {sbsb_private_desc}\n\n"
             "📊 <b>状态与词库</b>\n"
             "├ /status - 监控运行统计与健康报告\n"
             "├ /keywords - 🎯 <b>查看并交互式管理监控关键词</b>\n"
@@ -472,16 +494,19 @@ def handle_command_or_text(bot, chat_id, text):
         hours, remainder = divmod(int(uptime.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
         sources_list = "\n".join([f"  • {s['icon']} <b>{s['name']}</b> ({s['url']})" for s in bot.sources])
+        sbsb_private_status = "🟢 实时运行中" if bot.sbsb_cookie else "⚪ 未配置 SBSB_COOKIE"
         status_text = (
             "📊 <b>社区监控守护状态报告</b>\n\n"
             f"⏱️ <b>运行时间</b>: {hours}小时 {minutes}分 {seconds}秒\n"
             f"🔔 <b>推送状态</b>: {'⏸️ 已暂停' if bot.paused else '▶️ 运行中'}\n"
             f"📡 <b>轮询周期</b>: 每 {bot.poll_interval} 秒\n"
-            f"🌐 <b>已启用监控源 ({len(bot.sources)})</b>:\n{sources_list}\n"
+            f"🌐 <b>已启用公开监控源 ({len(bot.sources)})</b>:\n{sources_list}\n"
+            f"📬 <b>烧饼私信/回复监听</b>: {sbsb_private_status}\n"
             f"🎯 <b>监控关键词数</b>: {len(bot.keywords)} 个\n"
             f"🚫 <b>屏蔽词数</b>: {len(bot.blockwords)} 个\n"
-            f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇帖子\n"
-            f"🎁 <b>累计命中推送</b>: {bot.total_hit} 篇\n\n"
+            f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信\n"
+            f"🎁 <b>累计公开帖命中</b>: {bot.total_hit} 篇\n"
+            f"💌 <b>累计私信提醒</b>: {bot.total_private_notified} 次\n\n"
             "<i>💡 输入 /keywords 可查看或管理监控词库</i>"
         )
         bot.send_msg(chat_id, status_text)
@@ -543,8 +568,16 @@ def handle_command_or_text(bot, chat_id, text):
             "📝 <b>摘要</b>: 这是一条手动触发的烧饼论坛测试卡片，抽奖专区与全站流已全部接入监控。\n\n"
             "🔗 <b>链接</b>: https://sb.sb/t/931/"
         )
+        test_msg_pm = (
+            "📬 <b>🍪 [烧饼论坛] 收到新的私信/提醒！</b> (演示卡片)\n\n"
+            "👤 <b>发信人</b>: PanstarCloud\n"
+            "💬 <b>内容</b>: 恭喜您在【新人见面礼】活动中中奖！请查看中奖机器配置...\n"
+            "🕒 <b>时间</b>: 刚刚\n\n"
+            "🔗 <b>链接</b>: https://sb.sb/messages/demo-thread/"
+        )
         bot.send_msg(chat_id, test_msg_ns, disable_preview=False)
         bot.send_msg(chat_id, test_msg_sb, disable_preview=False)
+        bot.send_msg(chat_id, test_msg_pm, disable_preview=False)
     
     else:
         bot.send_msg(chat_id, f"❓ 未识别的指令：<code>{cmd}</code>\n请输入 /help 查看可用指令列表。")
@@ -555,7 +588,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.1"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -588,7 +621,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.0)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.1)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -596,6 +629,97 @@ def fetch_rss(url):
     except Exception as e:
         print(f"[{datetime.now()}] RSS 拉取异常 ({url}): {e}", flush=True)
         return None
+
+def sbsb_private_messages_thread(bot):
+    """烧饼论坛私信与个人消息轮询线程"""
+    if not bot.sbsb_cookie:
+        print(f"[{datetime.now()}] ℹ️ 烧饼论坛私信监控未配置 SBSB_COOKIE，私信监听保持挂起。", flush=True)
+        return
+
+    print(f"[{datetime.now()}] 📬 烧饼论坛 (sb.sb) 私信与回复监听引擎已启动...", flush=True)
+    first_run = len(bot.seen_msgs) == 0
+
+    class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def http_error_302(self, req, fp, code, msg, headers):
+            return fp
+        def http_error_303(self, req, fp, code, msg, headers):
+            return fp
+
+    opener = urllib.request.build_opener(NoRedirectHandler)
+
+    while True:
+        try:
+            req = urllib.request.Request(
+                "https://sb.sb/messages/",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    "Cookie": bot.sbsb_cookie,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://sb.sb/"
+                }
+            )
+
+            try:
+                resp = opener.open(req, timeout=15)
+                status_code = getattr(resp, "status", getattr(resp, "code", 200))
+                
+                # 如果重定向到登录页，说明 Cookie 失效
+                location = resp.headers.get("Location", "")
+                if status_code in [302, 303] and ("login" in location or "/login" in location):
+                    now_ts = time.time()
+                    if now_ts - bot.last_cookie_warn_time > 43200: # 12 小时最多提醒一次
+                        bot.last_cookie_warn_time = now_ts
+                        warn_msg = (
+                            "⚠️ <b>🍪 [烧饼论坛] 登录凭据 (SBSB_COOKIE) 已过期！</b>\n\n"
+                            "私信与个人消息推送已暂停。请在电脑浏览器重新登录烧饼论坛并复制 Cookie，更新至 VPS 的 <code>.env</code> 中。"
+                        )
+                        bot.send_msg(bot.admin_chat_id, warn_msg)
+                        print(f"[{datetime.now()}] ⚠️ 烧饼论坛 Cookie 已过期 (重定向至 {location})", flush=True)
+                    time.sleep(DEFAULT_PRIVATE_INTERVAL)
+                    continue
+
+                html_content = resp.read().decode("utf-8", errors="ignore")
+            except Exception as fe:
+                print(f"[{datetime.now()}] 拉取烧饼私信失败: {fe}", flush=True)
+                time.sleep(DEFAULT_PRIVATE_INTERVAL)
+                continue
+
+            # 解析对话列表（常见结构：/messages/{id}/）
+            # 匹配形如 href="/messages/([a-zA-Z0-9_-]+)/"
+            threads = re.findall(r'href=["\']/messages/([a-f0-9]{16,64})/?["\']', html_content)
+            unique_threads = list(dict.fromkeys(threads))
+
+            for thread_id in unique_threads:
+                # 提取该 thread 附近的文本块做摘要提取
+                thread_key = f"thread:{thread_id}"
+                
+                # 如果初次启动，记录到 seen_msgs
+                if first_run:
+                    bot.seen_msgs.add(thread_key)
+                    continue
+
+                if thread_key not in bot.seen_msgs:
+                    bot.seen_msgs.add(thread_key)
+                    bot.total_private_notified += 1
+                    print(f"[{datetime.now()}] 📬 发现烧饼论坛新私信对话: {thread_id}", flush=True)
+
+                    msg_text = (
+                        "📬 <b>🍪 [烧饼论坛] 收到新的私信或对话提醒！</b>\n\n"
+                        f"💬 <b>对话编号</b>: <code>{thread_id[:16]}...</code>\n"
+                        "💡 <i>您有新的私信或被回复，请点击下方直达链接查看详情。</i>\n\n"
+                        f"🔗 <b>链接</b>: https://sb.sb/messages/{thread_id}/"
+                    )
+                    bot.send_msg(bot.admin_chat_id, msg_text, disable_preview=False)
+
+            bot.save_seen_msgs()
+            if first_run:
+                first_run = False
+                print(f"[{datetime.now()}] ✅ 已初始化烧饼论坛私信历史 ({len(bot.seen_msgs)} 个对话)，开启实时监听！", flush=True)
+
+        except Exception as e:
+            print(f"[{datetime.now()}] 私信监控循环异常: {e}", flush=True)
+
+        time.sleep(DEFAULT_PRIVATE_INTERVAL)
 
 def rss_monitor_thread(bot):
     print(f"[{datetime.now()}] 📡 多社区 RSS 监控引擎已就绪 (共 {len(bot.sources)} 个源)...", flush=True)
@@ -640,7 +764,6 @@ def rss_monitor_thread(bot):
                         if creator_elem is not None and creator_elem.text:
                             author = creator_elem.text.strip()
                     elif source_id == "sbsb":
-                        # 烧饼论坛 RSS 的 author 未单独列出标签时，默认使用站点作者或标识
                         author = f"烧饼用户"
 
                     # 全局唯一去重键
@@ -685,13 +808,16 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.0 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.1 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()
 
     t_rss = threading.Thread(target=rss_monitor_thread, args=(bot,), daemon=True)
     t_rss.start()
+
+    t_private = threading.Thread(target=sbsb_private_messages_thread, args=(bot,), daemon=True)
+    t_private.start()
 
     while True:
         time.sleep(60)

@@ -35,7 +35,7 @@ DEFAULT_SOURCES = [
 ]
 
 DEFAULT_POLL_INTERVAL = 30
-DEFAULT_PRIVATE_INTERVAL = 60
+DEFAULT_PRIVATE_INTERVAL = 45
 
 # 默认关键词库（精准组合，避免单字误伤）
 DEFAULT_KEYWORDS = [
@@ -74,6 +74,7 @@ class BotManager:
         if not sbsb_cookie_val and os.environ.get("__Host-bbs_session"):
             sbsb_cookie_val = f"__Host-bbs_session={os.environ.get('__Host-bbs_session').strip()}"
         self.sbsb_cookie = sbsb_cookie_val
+        self.sbsb_uid = None
 
         self.lock = threading.Lock()
         self.start_time = datetime.now()
@@ -108,7 +109,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.3"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.4"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -194,7 +195,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.3"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.4"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -225,7 +226,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.3"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.4"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -241,7 +242,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.3"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.4"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -616,7 +617,7 @@ def handle_command_or_text(bot, chat_id, text):
         hours, remainder = divmod(int(uptime.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
         sources_list = "\n".join([f"  • {s['icon']} <b>{s['name']}</b> ({s['url']})" for s in bot.sources])
-        sbsb_private_status = "🟢 实时运行中（含每日 08:05 自动签到）" if bot.sbsb_cookie else "⚪ 未配置 SBSB_COOKIE"
+        sbsb_private_status = "🟢 实时运行中（含每日 08:05 自动签到与通知）" if bot.sbsb_cookie else "⚪ 未配置 SBSB_COOKIE"
         status_text = (
             "📊 <b>社区监控守护状态报告</b>\n\n"
             f"⏱️ <b>运行时间</b>: {hours}小时 {minutes}分 {seconds}秒\n"
@@ -626,9 +627,9 @@ def handle_command_or_text(bot, chat_id, text):
             f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_status}\n"
             f"🎯 <b>监控关键词数</b>: {len(bot.keywords)} 个\n"
             f"🚫 <b>屏蔽词数</b>: {len(bot.blockwords)} 个\n"
-            f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信\n"
+            f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信与通知\n"
             f"🎁 <b>累计公开帖命中</b>: {bot.total_hit} 篇\n"
-            f"💌 <b>累计私信提醒</b>: {bot.total_private_notified} 次\n\n"
+            f"💌 <b>累计互动通知</b>: {bot.total_private_notified} 次\n\n"
             "<i>💡 输入 /signin 可一键手动签到，输入 /keywords 可管理监控词库</i>"
         )
         bot.send_msg(chat_id, status_text)
@@ -691,11 +692,11 @@ def handle_command_or_text(bot, chat_id, text):
             "🔗 <b>链接</b>: https://sb.sb/t/931/"
         )
         test_msg_pm = (
-            "📬 <b>🍪 [烧饼论坛] 收到新的私信/提醒！</b> (演示卡片)\n\n"
-            "👤 <b>发信人</b>: PanstarCloud\n"
-            "💬 <b>内容</b>: 恭喜您在【新人见面礼】活动中中奖！请查看中奖机器配置...\n"
-            "🕒 <b>时间</b>: 刚刚\n\n"
-            "🔗 <b>链接</b>: https://sb.sb/messages/demo-thread/"
+            "📬 <b>🍪 [烧饼论坛] 收到新的互动通知！</b> (演示卡片)\n\n"
+            "👤 <b>用户</b>: 西风  |  🏷️ <b>类型</b>: #回复\n"
+            "💬 <b>内容</b>: 回复了你的主题：人多了就卡，毕竟这个程序很简单 @Xshell #2\n"
+            "🕒 <b>时间</b>: 3小时前\n\n"
+            "🔗 <b>直达链接</b>: https://sb.sb/t/2028/?reply_id=25485"
         )
         test_msg_signin = (
             "🍪 <b>烧饼论坛 (sb.sb) 签到与资产报告</b> (演示卡片)\n\n"
@@ -720,7 +721,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.3"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.4"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -753,7 +754,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.3)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.4)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -818,12 +819,12 @@ def sbsb_checkin_scheduler_thread(bot):
         time.sleep(300)
 
 def sbsb_private_messages_thread(bot):
-    """烧饼论坛私信与个人消息轮询线程"""
+    """烧饼论坛互动通知（回复/点赞/提及）与私信轮询线程"""
     if not bot.sbsb_cookie:
-        print(f"[{datetime.now()}] ℹ️ 烧饼论坛私信与签到引擎未配置 SBSB_COOKIE，私信监听保持挂起。", flush=True)
+        print(f"[{datetime.now()}] ℹ️ 烧饼论坛私信与通知引擎未配置 SBSB_COOKIE，监听保持挂起。", flush=True)
         return
 
-    print(f"[{datetime.now()}] 📬 烧饼论坛 (sb.sb) 私信与回复监听引擎已启动...", flush=True)
+    print(f"[{datetime.now()}] 📬 烧饼论坛 (sb.sb) 互动通知与私信监听引擎已启动...", flush=True)
     first_run = len(bot.seen_msgs) == 0
 
     class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -834,10 +835,37 @@ def sbsb_private_messages_thread(bot):
 
     opener = urllib.request.build_opener(NoRedirectHandler)
 
-    while True:
+    def get_user_uid():
+        if bot.sbsb_uid:
+            return bot.sbsb_uid
         try:
             req = urllib.request.Request(
-                "https://sb.sb/messages/",
+                "https://sb.sb/",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    "Cookie": bot.sbsb_cookie,
+                    "Referer": "https://sb.sb/"
+                }
+            )
+            resp = opener.open(req, timeout=12)
+            html = resp.read().decode("utf-8", errors="ignore")
+            uid_m = re.search(r'/u/(\d+)/\?tab=notifications', html) or re.search(r'/u/(\d+)/', html)
+            if uid_m:
+                bot.sbsb_uid = uid_m.group(1)
+                print(f"[{datetime.now()}] 🆔 成功识别烧饼论坛当前用户 UID: {bot.sbsb_uid}", flush=True)
+                return bot.sbsb_uid
+        except Exception as ue:
+            print(f"[{datetime.now()}] 获取 UID 失败: {ue}", flush=True)
+        return "1218"
+
+    while True:
+        try:
+            uid = get_user_uid()
+            notif_url = f"https://sb.sb/u/{uid}/?tab=notifications"
+
+            # 1. 拉取互动通知页（回复、点亮、提及、支持等）
+            req_notif = urllib.request.Request(
+                notif_url,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
                     "Cookie": bot.sbsb_cookie,
@@ -847,59 +875,118 @@ def sbsb_private_messages_thread(bot):
             )
 
             try:
-                resp = opener.open(req, timeout=15)
-                status_code = getattr(resp, "status", getattr(resp, "code", 200))
-                
-                location = resp.headers.get("Location", "")
+                resp_notif = opener.open(req_notif, timeout=15)
+                status_code = getattr(resp_notif, "status", getattr(resp_notif, "code", 200))
+                location = resp_notif.headers.get("Location", "")
                 if status_code in [302, 303] and ("login" in location or "/login" in location):
                     now_ts = time.time()
                     if now_ts - bot.last_cookie_warn_time > 43200:
                         bot.last_cookie_warn_time = now_ts
                         warn_msg = (
                             "⚠️ <b>🍪 [烧饼论坛] 登录凭据 (SBSB_COOKIE) 已过期！</b>\n\n"
-                            "私信推送与自动签到已暂停。请在电脑浏览器重新登录烧饼论坛并复制 Cookie，更新至 VPS 的 <code>.env</code> 中。"
+                            "互动通知推送与自动签到已暂停。请在电脑浏览器重新登录烧饼论坛并复制 Cookie，更新至 VPS 的 <code>.env</code> 中。"
                         )
                         bot.send_msg(bot.admin_chat_id, warn_msg)
                         print(f"[{datetime.now()}] ⚠️ 烧饼论坛 Cookie 已过期 (重定向至 {location})", flush=True)
                     time.sleep(DEFAULT_PRIVATE_INTERVAL)
                     continue
 
-                html_content = resp.read().decode("utf-8", errors="ignore")
+                html_notif = resp_notif.read().decode("utf-8", errors="ignore")
             except Exception as fe:
-                print(f"[{datetime.now()}] 拉取烧饼私信失败: {fe}", flush=True)
+                print(f"[{datetime.now()}] 拉取烧饼通知失败: {fe}", flush=True)
                 time.sleep(DEFAULT_PRIVATE_INTERVAL)
                 continue
 
-            threads = re.findall(r'href=["\']/messages/([a-f0-9]{16,64})/?["\']', html_content)
-            unique_threads = list(dict.fromkeys(threads))
+            # 解析通知列表
+            notif_blocks = re.findall(r'<li[^>]*class=\"[^\"]*notification-item[^\"]*\"[^>]*>(.*?)(?=<li[^>]*class=\"[^\"]*notification-item|$)', html_notif, re.DOTALL)
+            
+            # 倒序遍历（从旧到新推送）
+            for block in reversed(notif_blocks):
+                user_match = re.search(r'<a[^>]*class=\"[^\"]*post-title[^\"]*\"[^>]*>([^<]+)</a>', block)
+                user = user_match.group(1).strip() if user_match else "烧饼用户"
 
-            for thread_id in unique_threads:
-                thread_key = f"thread:{thread_id}"
-                
+                kind_match = re.search(r'<span[^>]*class=\"[^\"]*notification-kind[^\"]*\"[^>]*>([^<]+)</span>', block)
+                kind = kind_match.group(1).strip() if kind_match else "提醒"
+
+                time_match = re.search(r'<time datetime=\"([^\"]+)\">([^<]+)</time>', block)
+                iso_time = time_match.group(1).strip() if time_match else ""
+                rel_time = time_match.group(2).strip() if time_match else "刚刚"
+
+                content_match = re.search(r'<div[^>]*class=\"[^\"]*notification-content[^\"]*\"[^>]*>(.*?)</div>', block, re.DOTALL)
+                if content_match:
+                    content_raw = content_match.group(1)
+                    content = re.sub(r'<[^>]+>', ' ', content_raw)
+                    content = re.sub(r'\s+', ' ', content).strip()
+                else:
+                    content = "收到一条新的互动提醒"
+
+                link_match = re.search(r'<a[^>]*class=\"[^\"]*notification-reply-action[^\"]*\"[^>]*href=\"([^\"]+)\"', block) or re.search(r'href=\"(/t/\d+/[^\"]*)\"', block)
+                link = f"https://sb.sb{link_match.group(1)}" if link_match else f"https://sb.sb/u/{uid}/?tab=notifications"
+
+                unique_key = f"notif:{iso_time}_{user}_{kind}"
+
                 if first_run:
-                    bot.seen_msgs.add(thread_key)
+                    bot.seen_msgs.add(unique_key)
                     continue
 
-                if thread_key not in bot.seen_msgs:
-                    bot.seen_msgs.add(thread_key)
+                if unique_key not in bot.seen_msgs:
+                    bot.seen_msgs.add(unique_key)
                     bot.total_private_notified += 1
-                    print(f"[{datetime.now()}] 📬 发现烧饼论坛新私信对话: {thread_id}", flush=True)
+                    print(f"[{datetime.now()}] 📬 命中烧饼论坛新互动通知: [{kind}] {user} - {content}", flush=True)
 
-                    msg_text = (
-                        "📬 <b>🍪 [烧饼论坛] 收到新的私信或对话提醒！</b>\n\n"
-                        f"💬 <b>对话编号</b>: <code>{thread_id[:16]}...</code>\n"
-                        "💡 <i>您有新的私信或被回复，请点击下方直达链接查看详情。</i>\n\n"
-                        f"🔗 <b>链接</b>: https://sb.sb/messages/{thread_id}/"
+                    msg_card = (
+                        f"📬 <b>🍪 [烧饼论坛] 收到新的互动通知！</b>\n\n"
+                        f"👤 <b>用户</b>: {user}  |  🏷️ <b>类型</b>: #{kind}\n"
+                        f"💬 <b>内容</b>: {content}\n"
+                        f"🕒 <b>时间</b>: {rel_time}\n\n"
+                        f"🔗 <b>直达链接</b>: {link}"
                     )
-                    bot.send_msg(bot.admin_chat_id, msg_text, disable_preview=False)
+                    bot.send_msg(bot.admin_chat_id, msg_card, disable_preview=False)
+
+            # 2. 拉取私信信箱（1对1 私信消息）
+            try:
+                req_msg = urllib.request.Request(
+                    "https://sb.sb/messages/",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                        "Cookie": bot.sbsb_cookie,
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Referer": "https://sb.sb/"
+                    }
+                )
+                resp_msg = opener.open(req_msg, timeout=15)
+                html_msg = resp_msg.read().decode("utf-8", errors="ignore")
+                threads = re.findall(r'href=["\']/messages/([a-f0-9]{16,64})/?["\']', html_msg)
+                unique_threads = list(dict.fromkeys(threads))
+
+                for thread_id in unique_threads:
+                    thread_key = f"thread:{thread_id}"
+                    if first_run:
+                        bot.seen_msgs.add(thread_key)
+                        continue
+
+                    if thread_key not in bot.seen_msgs:
+                        bot.seen_msgs.add(thread_key)
+                        bot.total_private_notified += 1
+                        print(f"[{datetime.now()}] 📬 发现烧饼论坛新私信对话: {thread_id}", flush=True)
+
+                        msg_text = (
+                            "📬 <b>🍪 [烧饼论坛] 收到新的私信对话！</b>\n\n"
+                            f"💬 <b>对话编号</b>: <code>{thread_id[:16]}...</code>\n"
+                            "💡 <i>您有新的私信消息，请点击下方直达链接查看。</i>\n\n"
+                            f"🔗 <b>直达链接</b>: https://sb.sb/messages/{thread_id}/"
+                        )
+                        bot.send_msg(bot.admin_chat_id, msg_text, disable_preview=False)
+            except Exception as me:
+                print(f"[{datetime.now()}] 拉取私信异常: {me}", flush=True)
 
             bot.save_seen_msgs()
             if first_run:
                 first_run = False
-                print(f"[{datetime.now()}] ✅ 已初始化烧饼论坛私信历史 ({len(bot.seen_msgs)} 个对话)，开启实时监听！", flush=True)
+                print(f"[{datetime.now()}] ✅ 已初始化烧饼论坛通知与私信历史 ({len(bot.seen_msgs)} 条)，开启实时监听！", flush=True)
 
         except Exception as e:
-            print(f"[{datetime.now()}] 私信监控循环异常: {e}", flush=True)
+            print(f"[{datetime.now()}] 通知监控循环异常: {e}", flush=True)
 
         time.sleep(DEFAULT_PRIVATE_INTERVAL)
 
@@ -986,7 +1073,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.3 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.4 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

@@ -68,7 +68,13 @@ class BotManager:
     def __init__(self):
         self.bot_token = os.environ.get("TG_BOT_TOKEN", "").strip()
         self.admin_chat_id = str(os.environ.get("TG_CHAT_ID", "")).strip()
-        self.sbsb_cookie = os.environ.get("SBSB_COOKIE", "").strip()
+        
+        # 兼容 SBSB_COOKIE 或直接配置 __Host-bbs_session 变量
+        sbsb_cookie_val = os.environ.get("SBSB_COOKIE", "").strip()
+        if not sbsb_cookie_val and os.environ.get("__Host-bbs_session"):
+            sbsb_cookie_val = f"__Host-bbs_session={os.environ.get('__Host-bbs_session').strip()}"
+        self.sbsb_cookie = sbsb_cookie_val
+
         self.lock = threading.Lock()
         self.start_time = datetime.now()
         self.paused = False
@@ -102,7 +108,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.2"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.3"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -188,7 +194,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.2"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.3"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -219,7 +225,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.2"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.3"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -235,7 +241,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.2"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.3"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -340,7 +346,7 @@ def make_keyword_buttons(keywords, prefix="del_kw"):
     return {"inline_keyboard": keyboard}
 
 def do_sbsb_signin(cookie):
-    """执行烧饼论坛自动签到并解析结果"""
+    """执行烧饼论坛自动签到并精确解析资产与连续天数"""
     if not cookie:
         return {"success": False, "msg": "未配置 SBSB_COOKIE，请先在 VPS 配置 Cookie"}
 
@@ -359,6 +365,7 @@ def do_sbsb_signin(cookie):
 
     opener = urllib.request.build_opener(NoRedirectHandler)
 
+    # 1. 访问 /signin/ 页面
     try:
         req = urllib.request.Request("https://sb.sb/signin/", headers=headers)
         resp = opener.open(req, timeout=15)
@@ -367,15 +374,13 @@ def do_sbsb_signin(cookie):
         if status_code in [302, 303] and ("login" in location or "/login" in location):
             return {"success": False, "msg": "Cookie 已失效，请在 VPS 重新填入 SBSB_COOKIE"}
 
-        html = resp.read().decode("utf-8", errors="ignore")
+        html_signin = resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
         return {"success": False, "msg": f"访问签到页面异常: {e}"}
 
-    # 提取 CSRF Token
-    csrf_match = re.search(r'name=["\']_csrf["\']\s+value=["\']([^"\']+)["\']', html) or re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_csrf["\']', html)
-    
-    # 如果页面有 CSRF 且有签到表单按钮，执行 POST 签到
-    if csrf_match:
+    # 提取 CSRF Token 并尝试提交签到表单
+    csrf_match = re.search(r'name=["\']_csrf["\']\s+value=["\']([^"\']+)["\']', html_signin) or re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_csrf["\']', html_signin)
+    if csrf_match and ("今日已签" not in html_signin and "明日再来" not in html_signin):
         csrf_token = csrf_match.group(1)
         post_data = urllib.parse.urlencode({"_csrf": csrf_token}).encode("utf-8")
         post_headers = dict(headers)
@@ -384,29 +389,54 @@ def do_sbsb_signin(cookie):
         try:
             post_req = urllib.request.Request("https://sb.sb/signin/", data=post_data, headers=post_headers)
             post_resp = opener.open(post_req, timeout=15)
-            html = post_resp.read().decode("utf-8", errors="ignore")
+            html_signin = post_resp.read().decode("utf-8", errors="ignore")
         except Exception as e:
-            return {"success": False, "msg": f"提交签到请求失败: {e}"}
+            print(f"[{datetime.now()}] 提交签到请求异常: {e}", flush=True)
 
-    # 提取连续天数与积分
-    days_match = re.search(r'连续签到\s*(\d+)\s*天', html) or re.search(r'(\d+)\s*天', html)
-    points_match = re.search(r'(\d+)\s*(?:个|块)?烧饼', html) or re.search(r'烧饼[^\d]*(\d+)', html)
-    
-    days = days_match.group(1) if days_match else "已更新"
-    points = points_match.group(1) if points_match else "已入账"
+    # 提取连续签到天数
+    days_match = re.search(r'<span[^>]*class=\"[^\"]*counter-value[^\"]*\"[^>]*>(\d+)</span>\s*<span[^>]*>连续签到', html_signin) or re.search(r'(\d+)\s*连续签到', html_signin)
+    days = days_match.group(1) if days_match else "1"
 
-    # 提取 flash 消息
-    flash_match = re.search(r'window\.__pageFlash=["\']([^"\']*)["\']', html) or re.search(r'class=["\'][^"\']*toast[^"\']*["\']>([^<]+)<', html)
-    flash_msg = flash_match.group(1).strip() if flash_match and flash_match.group(1).strip() else "签到成功 (+1 烧饼)"
+    # 2. 访问 /points/ 页面提取精确资产与等级
+    points = "0"
+    exp = "0"
+    level = "会员"
+    try:
+        req_points = urllib.request.Request("https://sb.sb/points/", headers=headers)
+        resp_points = opener.open(req_points, timeout=15)
+        html_points = resp_points.read().decode("utf-8", errors="ignore")
+        
+        # 提取可用烧饼
+        pts_match = re.search(r'可用烧饼</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>(\d+)</span>', html_points) or re.search(r'可用烧饼.*?(\d+)', html_points)
+        if pts_match:
+            points = pts_match.group(1)
+            
+        # 提取成长值
+        exp_match = re.search(r'成长值</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>(\d+)</span>', html_points) or re.search(r'成长值.*?(\d+)', html_points)
+        if exp_match:
+            exp = exp_match.group(1)
 
-    already = "已签到" in flash_msg or "明日再来" in html or "今日已签" in html
+        # 提取等级
+        lv_match = re.search(r'等级</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>([^<]+)</span>', html_points) or re.search(r'等级.*?(Lv\.\d+[^<\n]+)', html_points)
+        if lv_match:
+            level = lv_match.group(1).strip()
+    except Exception as pe:
+        print(f"[{datetime.now()}] 访问 points 页面异常: {pe}", flush=True)
+
+    # 提取反馈消息
+    flash_match = re.search(r'window\.__pageFlash=["\']([^"\']*)["\']', html_signin) or re.search(r'class=["\'][^"\']*toast[^"\']*["\']>([^<]+)<', html_signin)
+    flash_msg = flash_match.group(1).strip() if flash_match and flash_match.group(1).strip() else "签到成功"
+
+    already = "已签到" in flash_msg or "明日再来" in html_signin or "今日已签" in html_signin
 
     return {
         "success": True,
         "already": already,
         "msg": flash_msg,
-        "consecutive_days": days,
-        "total_points": points
+        "consecutive_days": f"{days} 天",
+        "total_points": f"{points} 饼",
+        "exp": exp,
+        "level": level
     }
 
 def handle_callback_query(bot, query):
@@ -569,12 +599,12 @@ def handle_command_or_text(bot, chat_id, text):
             status_badge = "✅ 签到成功！" if not res.get("already") else "✨ 今日已完成签到"
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             report_msg = (
-                f"🍪 <b>烧饼论坛 (sb.sb) 签到报告</b>\n\n"
+                f"🍪 <b>烧饼论坛 (sb.sb) 签到与资产报告</b>\n\n"
                 f"🎉 <b>签到状态</b>: {status_badge}\n"
-                f"📝 <b>反馈提示</b>: <code>{res.get('msg')}</code>\n"
                 f"📅 <b>连续签到</b>: <b>{res.get('consecutive_days')}</b>\n"
-                f"💰 <b>烧饼资产</b>: <b>{res.get('total_points')}</b>\n"
-                f"🕒 <b>执行时间</b>: {now_str}\n\n"
+                f"💰 <b>可用烧饼</b>: <b>{res.get('total_points')}</b>\n"
+                f"⭐ <b>成长等级</b>: <b>{res.get('level')}</b> (成长值: {res.get('exp')})\n"
+                f"🕒 <b>同步时间</b>: {now_str}\n\n"
                 "<i>💡 系统将在每日 08:05 (UTC+8) 自动执行定时签到</i>"
             )
             bot.send_msg(chat_id, report_msg)
@@ -668,12 +698,12 @@ def handle_command_or_text(bot, chat_id, text):
             "🔗 <b>链接</b>: https://sb.sb/messages/demo-thread/"
         )
         test_msg_signin = (
-            "🍪 <b>烧饼论坛 (sb.sb) 签到报告</b> (演示卡片)\n\n"
-            "🎉 <b>签到状态</b>: ✅ 签到成功！ (+1 烧饼)\n"
-            "📝 <b>反馈提示</b>: <code>获得 1 个烧饼，连续签到 7 天奖励已入账</code>\n"
-            "📅 <b>连续签到</b>: <b>7 天</b>\n"
-            "💰 <b>烧饼资产</b>: <b>158 烧饼</b>\n"
-            "🕒 <b>执行时间</b>: 2026-08-25 08:05:00\n\n"
+            "🍪 <b>烧饼论坛 (sb.sb) 签到与资产报告</b> (演示卡片)\n\n"
+            "🎉 <b>签到状态</b>: ✨ 今日已完成签到\n"
+            "📅 <b>连续签到</b>: <b>1 天</b>\n"
+            "💰 <b>可用烧饼</b>: <b>25 饼</b>\n"
+            "⭐ <b>成长等级</b>: <b>Lv.2 新手上路</b> (成长值: 41)\n"
+            "🕒 <b>同步时间</b>: 2026-08-25 08:05:00\n\n"
             "<i>💡 系统将在每日 08:05 (UTC+8) 自动执行定时签到</i>"
         )
         bot.send_msg(chat_id, test_msg_ns, disable_preview=False)
@@ -690,7 +720,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.2"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.3"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -723,7 +753,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.2)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.3)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -755,13 +785,11 @@ def sbsb_checkin_scheduler_thread(bot):
 
     while True:
         try:
-            # 获取北京时间 (UTC+8)
             tz_cst = timezone(timedelta(hours=8))
             now_cst = datetime.now(tz_cst)
             today_str = now_cst.strftime("%Y-%m-%d")
             last_date = get_last_checkin_date()
 
-            # 如果今天还没签过，且当前时间 >= 08:05 (或者初次启动触发)
             if last_date != today_str:
                 if now_cst.hour >= 8 or last_date == "":
                     print(f"[{datetime.now()}] 🎯 触发烧饼论坛每日自动签到流水线...", flush=True)
@@ -773,9 +801,9 @@ def sbsb_checkin_scheduler_thread(bot):
                         report_msg = (
                             f"🍪 <b>烧饼论坛 (sb.sb) 每日自动签到报告</b>\n\n"
                             f"🎉 <b>签到状态</b>: {status_badge}\n"
-                            f"📝 <b>系统反馈</b>: <code>{res.get('msg')}</code>\n"
                             f"📅 <b>连续签到</b>: <b>{res.get('consecutive_days')}</b>\n"
-                            f"💰 <b>当前资产</b>: <b>{res.get('total_points')}</b>\n"
+                            f"💰 <b>可用烧饼</b>: <b>{res.get('total_points')}</b>\n"
+                            f"⭐ <b>成长等级</b>: <b>{res.get('level')}</b> (成长值: {res.get('exp')})\n"
                             f"🕒 <b>完成时间</b>: {now_str}\n\n"
                             "<i>💡 每日 08:05 (UTC+8) 定时自动执行</i>"
                         )
@@ -787,7 +815,7 @@ def sbsb_checkin_scheduler_thread(bot):
         except Exception as e:
             print(f"[{datetime.now()}] 签到调度器异常: {e}", flush=True)
 
-        time.sleep(300) # 每 5 分钟探测一次时钟
+        time.sleep(300)
 
 def sbsb_private_messages_thread(bot):
     """烧饼论坛私信与个人消息轮询线程"""
@@ -822,11 +850,10 @@ def sbsb_private_messages_thread(bot):
                 resp = opener.open(req, timeout=15)
                 status_code = getattr(resp, "status", getattr(resp, "code", 200))
                 
-                # 如果重定向到登录页，说明 Cookie 失效
                 location = resp.headers.get("Location", "")
                 if status_code in [302, 303] and ("login" in location or "/login" in location):
                     now_ts = time.time()
-                    if now_ts - bot.last_cookie_warn_time > 43200: # 12 小时最多提醒一次
+                    if now_ts - bot.last_cookie_warn_time > 43200:
                         bot.last_cookie_warn_time = now_ts
                         warn_msg = (
                             "⚠️ <b>🍪 [烧饼论坛] 登录凭据 (SBSB_COOKIE) 已过期！</b>\n\n"
@@ -843,14 +870,12 @@ def sbsb_private_messages_thread(bot):
                 time.sleep(DEFAULT_PRIVATE_INTERVAL)
                 continue
 
-            # 解析对话列表（常见结构：/messages/{id}/）
             threads = re.findall(r'href=["\']/messages/([a-f0-9]{16,64})/?["\']', html_content)
             unique_threads = list(dict.fromkeys(threads))
 
             for thread_id in unique_threads:
                 thread_key = f"thread:{thread_id}"
                 
-                # 如果初次启动，记录到 seen_msgs
                 if first_run:
                     bot.seen_msgs.add(thread_key)
                     continue
@@ -900,7 +925,6 @@ def rss_monitor_thread(bot):
                     continue
 
                 items = channel.findall("item")
-                # 倒序遍历（从旧到新），确保新帖按先后顺序入库和推送
                 for item in reversed(items):
                     guid_elem = item.find("guid")
                     title_elem = item.find("title")
@@ -914,7 +938,6 @@ def rss_monitor_thread(bot):
                     desc = desc_elem.text.strip() if desc_elem is not None and desc_elem.text else ""
                     cat = category_elem.text.strip() if category_elem is not None and category_elem.text else "综合"
 
-                    # 提取作者
                     author = "未知"
                     if author_tag:
                         creator_elem = item.find(author_tag)
@@ -923,7 +946,6 @@ def rss_monitor_thread(bot):
                     elif source_id == "sbsb":
                         author = f"烧饼用户"
 
-                    # 全局唯一去重键
                     unique_id = f"{source_id}:{raw_guid or link}"
                     if not unique_id or unique_id in bot.seen_ids:
                         continue
@@ -934,7 +956,6 @@ def rss_monitor_thread(bot):
                     if first_run:
                         continue
 
-                    # 判断是否命中监控条件
                     if not bot.paused and bot.is_match(title, desc):
                         bot.total_hit += 1
                         print(f"[{datetime.now()}] 🎁 命中抽奖/福利贴: [{source_name}] [{cat}] {title} (作者: {author})", flush=True)
@@ -965,7 +986,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.2 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.3 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

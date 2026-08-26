@@ -73,7 +73,12 @@ class BotManager:
         # 兼容 SBSB_COOKIE 或直接配置 __Host-bbs_session 变量
         sbsb_cookie_val = os.environ.get("SBSB_COOKIE", "").strip()
         if not sbsb_cookie_val and os.environ.get("__Host-bbs_session"):
-            sbsb_cookie_val = f"__Host-bbs_session={os.environ.get('__Host-bbs_session').strip()}"
+            sbsb_cookie_val = os.environ.get("__Host-bbs_session").strip()
+            
+        # 智能容错：如果用户直接填入纯值（不含等号），自动补齐 __Host-bbs_session= 前缀
+        if sbsb_cookie_val and "=" not in sbsb_cookie_val:
+            sbsb_cookie_val = f"__Host-bbs_session={sbsb_cookie_val}"
+
         self.sbsb_cookie = sbsb_cookie_val
         self.sbsb_uid = None
 
@@ -110,7 +115,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.6"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.7"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -214,7 +219,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.6"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.7"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -245,7 +250,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.6"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.7"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -261,7 +266,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.6"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.7"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -392,6 +397,10 @@ def do_sbsb_signin(cookie):
     """执行烧饼论坛自动签到并精确解析资产、成长值、连续天数与官方签到时间"""
     if not cookie:
         return {"success": False, "msg": "未配置 SBSB_COOKIE，请先在 VPS 配置 Cookie"}
+
+    # 智能补齐 Cookie 键名
+    if "=" not in cookie:
+        cookie = f"__Host-bbs_session={cookie}"
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -805,7 +814,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.6"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.7"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -838,7 +847,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.6)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.7)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -939,7 +948,7 @@ def sbsb_private_messages_thread(bot):
                 return bot.sbsb_uid
         except Exception as ue:
             print(f"[{datetime.now()}] 获取 UID 失败: {ue}", flush=True)
-        return "1218"
+        return "7069"
 
     while True:
         try:
@@ -1158,7 +1167,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.6 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.7 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

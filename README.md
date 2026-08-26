@@ -1,4 +1,4 @@
-# 🎁 Multi-Community TG Monitor (NodeSeek & 烧饼论坛 抽奖与热帖监控 Bot)
+# 🎁 Community TG Monitor (多社区抽奖与热帖监控 Bot)
 
 > 纯轻量、零外部依赖、官方原生 RSS 驱动的多社区（NodeSeek + 烧饼论坛 sb.sb）抽奖/福利/特价新帖实时监控、烧饼论坛自动签到与 Telegram 双向交互推送机器人。
 
@@ -66,7 +66,7 @@
 
 #### 1. 创建目录与配置文件
 ```bash
-mkdir -p nodeseek-monitor && cd nodeseek-monitor
+mkdir -p community-monitor && cd community-monitor
 
 # 创建配置文件 .env
 cat << 'ENV_EOF' > .env
@@ -83,9 +83,9 @@ chmod 600 .env
 # 创建 docker-compose.yml
 cat << 'COMPOSE_EOF' > docker-compose.yml
 services:
-  nodeseek-monitor:
-    image: ghcr.io/j2st1n/nodeseek-tg-monitor:latest
-    container_name: nodeseek-monitor
+  community-monitor:
+    image: ghcr.io/j2st1n/community-tg-monitor:latest
+    container_name: community-monitor
     restart: unless-stopped
     env_file:
       - .env

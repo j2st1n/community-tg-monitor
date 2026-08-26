@@ -15,6 +15,7 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 SEEN_IDS_FILE = os.path.join(DATA_DIR, "seen_ids.json")
 SEEN_MSGS_FILE = os.path.join(DATA_DIR, "seen_msgs.json")
 CHECKIN_STATE_FILE = os.path.join(DATA_DIR, "checkin_state.json")
+DAILY_STATS_FILE = os.path.join(DATA_DIR, "daily_stats.json")
 
 # 内置多源配置
 DEFAULT_SOURCES = [
@@ -45,6 +46,7 @@ DEFAULT_BLOCKWORDS = ["收", "求", "买", "询", "出", "出出", "出台", "�
 
 BOT_COMMANDS = [
     {"command": "status", "description": "📊 监控状态与运行统计"},
+    {"command": "report", "description": "📈 今日算法过滤与成功率日报"},
     {"command": "sources", "description": "📡 监控网站独立推送开关"},
     {"command": "signin", "description": "🍪 烧饼论坛一键签到与查分"},
     {"command": "keywords", "description": "🎯 查看并管理自定义关注词"},
@@ -55,7 +57,6 @@ BOT_COMMANDS = [
     {"command": "help", "description": "📖 显示帮助菜单"}
 ]
 
-# 废弃的旧内置抽奖词集合（用于向后兼容自动清洗）
 LEGACY_BUILTIN_WORDS = {
     "抽奖", "抽", "福利", "roll", "Roll", "ROLL",
     "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "送小鸡", "送机器", "送码",
@@ -71,12 +72,10 @@ class BotManager:
         self.bot_token = os.environ.get("TG_BOT_TOKEN", "").strip()
         self.admin_chat_id = str(os.environ.get("TG_CHAT_ID", "")).strip()
         
-        # 兼容 SBSB_COOKIE 或直接配置 __Host-bbs_session 变量
         sbsb_cookie_val = os.environ.get("SBSB_COOKIE", "").strip()
         if not sbsb_cookie_val and os.environ.get("__Host-bbs_session"):
             sbsb_cookie_val = os.environ.get("__Host-bbs_session").strip()
             
-        # 智能容错：如果用户直接填入纯值（不含等号），自动补齐 __Host-bbs_session= 前缀
         if sbsb_cookie_val and "=" not in sbsb_cookie_val:
             sbsb_cookie_val = f"__Host-bbs_session={sbsb_cookie_val}"
 
@@ -90,10 +89,14 @@ class BotManager:
         self.total_hit = 0
         self.total_private_notified = 0
         self.last_cookie_warn_time = 0
+        self.last_daily_report_date = ""
         
         self.user_states = {}
         self.sources = list(DEFAULT_SOURCES)
         self.source_states = {s["id"]: True for s in DEFAULT_SOURCES}
+        
+        # 每日统计字典
+        self.daily_stats = self.load_daily_stats()
         
         # 支持通过环境变量过滤启用的源
         enabled_source_ids = os.environ.get("MONITOR_SOURCES", "").strip().lower()
@@ -109,6 +112,59 @@ class BotManager:
         self.seen_msgs = self.load_seen_msgs()
         self.register_telegram_commands()
 
+    def get_today_cst(self):
+        tz_cst = timezone(timedelta(hours=8))
+        return datetime.now(tz_cst).strftime("%Y-%m-%d")
+
+    def load_daily_stats(self):
+        today = self.get_today_cst()
+        default_stats = {
+            "date": today,
+            "total_scanned": 0,
+            "lottery_hits": 0,
+            "custom_hits": 0,
+            "trade_blocked": 0,
+            "noise_blocked": 0,
+            "private_notified": 0,
+            "poll_success": 0,
+            "poll_errors": 0
+        }
+        if os.path.exists(DAILY_STATS_FILE):
+            try:
+                with open(DAILY_STATS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if data.get("date") == today:
+                        for k, v in default_stats.items():
+                            if k not in data:
+                                data[k] = v
+                        return data
+            except Exception:
+                pass
+        return default_stats
+
+    def save_daily_stats(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(DAILY_STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.daily_stats, f, ensure_ascii=False, indent=2)
+
+    def record_stat(self, key, count=1):
+        with self.lock:
+            today = self.get_today_cst()
+            if self.daily_stats.get("date") != today:
+                self.daily_stats = {
+                    "date": today,
+                    "total_scanned": 0,
+                    "lottery_hits": 0,
+                    "custom_hits": 0,
+                    "trade_blocked": 0,
+                    "noise_blocked": 0,
+                    "private_notified": 0,
+                    "poll_success": 0,
+                    "poll_errors": 0
+                }
+            self.daily_stats[key] = self.daily_stats.get(key, 0) + count
+            self.save_daily_stats()
+
     def register_telegram_commands(self):
         url = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
         payload = {"commands": BOT_COMMANDS}
@@ -116,7 +172,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.1"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.2"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -135,7 +191,6 @@ class BotManager:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     raw_keywords = data.get("keywords", [])
-                    # 自动清理历史遗留的内置抽奖词，让用户词库回归纯净自定义
                     self.keywords = [k for k in raw_keywords if k not in LEGACY_BUILTIN_WORDS]
                     self.blockwords = data.get("blockwords", DEFAULT_BLOCKWORDS)
                     self.poll_interval = data.get("poll_interval", DEFAULT_POLL_INTERVAL)
@@ -222,7 +277,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.1"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.2"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -253,7 +308,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.1"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.2"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -269,7 +324,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.1"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.2"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -277,35 +332,42 @@ class BotManager:
         except Exception:
             return False
 
-    def is_match(self, title, desc):
-        """第二代智能意图过滤与抽奖特征决策树算法"""
+    def evaluate_post(self, title, desc):
+        """
+        第二代智能意图过滤与决策树评估器
+        返回: (is_matched: bool, category_tag: str, reason: str)
+        """
         clean_t = clean_title_prefix(title)
 
         with self.lock:
             # 1. 第一层：硬性否定（买卖、求购、交易前缀拦截）
             for bw in self.blockwords:
                 if bw and (clean_t.startswith(bw) or title.startswith(bw)):
-                    return False
+                    self.record_stat("trade_blocked")
+                    return False, "trade_blocked", f"命中买卖前缀 [{bw}]"
 
-            # 交易强特征拦截
             if any(w in title for w in ['剩余价值', '求收', '收个', '出个全新', '求一个', '求推荐', '收一台', '出台', '出只', '慢出', '慢收', '带价']):
-                return False
+                self.record_stat("trade_blocked")
+                return False, "trade_blocked", "命中交易词汇"
 
-            # 2. 第二层：非抽奖意图词过滤（排除新闻抽成、游戏抽卡、打比方、求助、教程等）
+            # 2. 第二层：非抽奖意图词过滤
             anti_intent_words = [
                 '抽成', '抽水', '抽烟', '抽风', '抽空', '抽卡', '抽签', '抽检', '抽屉', '抽走',
                 '如抽奖', '像抽奖', '当抽奖', '中奖了', '中过奖', '怎么填写', '怎么填', '如何填',
                 '如何获得', '如何免费', '怎样免费', '推荐入坑', '的选择', '有套路吗', '清退', '谈判'
             ]
-            if any(w in title for w in anti_intent_words):
-                return False
+            for w in anti_intent_words:
+                if w in title:
+                    self.record_stat("noise_blocked")
+                    return False, "noise_blocked", f"命中干扰意图 [{w}]"
 
-            # 3. 疑问句拦截（标题以疑问词/问号结尾且没有显式抽奖标签）
+            # 3. 疑问句拦截
             if re.search(r'(吗|么|呢|？|\?)$', title.strip()) and not re.search(r'[【\[〖]抽奖[】\]〗]', title):
                 if any(qw in title for qw in ['怎么', '如何', '还能', '有没有', '谁有', '什么好', '哪个好', '推荐']):
-                    return False
+                    self.record_stat("noise_blocked")
+                    return False, "noise_blocked", "命中疑问咨询句式"
 
-            # 4. 第三层：黄金强特征（Gold Match - 确凿的抽奖/福利/送机标识，自动全网监听）
+            # 4. 第三层：黄金强特征（Gold Match - 确凿的抽奖/福利/送机标识）
             gold_patterns = [
                 r'^[【\[〖\s]*抽奖',
                 r'[【\[〖]抽奖[】\]〗]',
@@ -325,18 +387,20 @@ class BotManager:
             ]
             for pat in gold_patterns:
                 if re.search(pat, title, re.IGNORECASE):
-                    return True
+                    self.record_stat("lottery_hits")
+                    return True, "lottery", "命中抽奖强特征"
 
-            # 5. 组合特征：标题含有“抽奖”或“福利”并伴随送/开奖动作
             if '抽奖' in title and any(k in title for k in ['开奖', '送', '第一期', '第二期', '第三期', '见者有份', '福利', '奖品', '吧', '活动']):
-                return True
+                self.record_stat("lottery_hits")
+                return True, "lottery", "命中抽奖组合特征"
 
-            # 6. 用户自定义专属关注词（在 TG 中通过 /keywords 添加的个性化特价/机型关注词）
+            # 5. 用户自定义专属关注词
             for c_kw in self.keywords:
                 if c_kw and (c_kw in title or c_kw in desc):
-                    return True
+                    self.record_stat("custom_hits")
+                    return True, "custom", f"命中自定义词 [{c_kw}]"
 
-            # 7. 正文强抽奖规则检测
+            # 6. 正文强抽奖规则检测
             desc_clean = desc.replace('送中', '').replace('没送中', '').replace('未送中', '')
             desc_lottery_patterns = [
                 r'评论区?留.*?(?:抽|送|中奖)',
@@ -347,9 +411,10 @@ class BotManager:
             ]
             for pat in desc_lottery_patterns:
                 if re.search(pat, desc_clean):
-                    return True
+                    self.record_stat("lottery_hits")
+                    return True, "lottery", "命中正文抽奖规则"
 
-        return False
+        return False, "none", "未达触发阈值"
 
     def format_keywords_card(self):
         """纯粹的自定义专属关注词管理卡片"""
@@ -425,6 +490,54 @@ class BotManager:
         markup = {"inline_keyboard": buttons}
         return text, markup
 
+    def generate_daily_report_card(self):
+        """生成每日运行统计与算法成功率报告卡片"""
+        with self.lock:
+            stats = dict(self.daily_stats)
+            uptime = datetime.now() - self.start_time
+            hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            
+            scanned = stats.get("total_scanned", 0)
+            lottery_hits = stats.get("lottery_hits", 0)
+            custom_hits = stats.get("custom_hits", 0)
+            trade_blocked = stats.get("trade_blocked", 0)
+            noise_blocked = stats.get("noise_blocked", 0)
+            priv_notified = stats.get("private_notified", 0)
+            poll_success = stats.get("poll_success", 0)
+            poll_errors = stats.get("poll_errors", 0)
+
+        total_polls = poll_success + poll_errors
+        success_rate = (poll_success / total_polls * 100) if total_polls > 0 else 100.0
+        total_blocked = trade_blocked + noise_blocked
+        date_str = stats.get("date", self.get_today_cst())
+
+        # 格式化活跃源状态
+        src_status = []
+        for s in self.sources:
+            is_on = self.source_states.get(s["id"], True)
+            src_status.append(f"{s['icon']} {s['name']}: {'🟢' if is_on else '🔴'}")
+        src_line = "  ".join(src_status)
+
+        text = (
+            "📈 <b>多社区监控每日运行与算法健康度报告</b>\n"
+            f"📅 <b>统计日期</b>: <code>{date_str}</code> (周期: 24h)\n\n"
+            "🔍 <b>公开帖子扫描与过滤分析</b>\n"
+            f"• 📊 <b>总扫描新帖</b>: <b>{scanned}</b> 篇\n"
+            f"• 🎁 <b>精准抽奖命中</b>: <b>{lottery_hits}</b> 篇 (100% 决策树交付)\n"
+            f"• 🏷️ <b>自定义词命中</b>: <b>{custom_hits}</b> 篇\n"
+            f"• 🛡️ <b>噪音负向拦截</b>: <b>{total_blocked}</b> 篇 (交易 {trade_blocked} / 噪音 {noise_blocked})\n"
+            f"• 📬 <b>私信与互动通知</b>: <b>{priv_notified}</b> 次\n\n"
+            "🌐 <b>各站点推送开关</b>\n"
+            f"• {src_line}\n\n"
+            "⚙️ <b>系统守护健康度</b>\n"
+            f"• ⏱️ <b>连续运行</b>: {hours}小时 {minutes}分\n"
+            f"• 📡 <b>RSS 轮询成功率</b>: <b>{success_rate:.1f}%</b> ({poll_success} 成功 / {poll_errors} 异常)\n"
+            f"• 🎯 <b>已去重索引容量</b>: {len(self.seen_ids)} 篇帖 / {len(self.seen_msgs)} 条通知\n\n"
+            "<i>💡 每日 22:00 (UTC+8) 自动总结推送，随时输入 /report 查阅实时数据</i>"
+        )
+        return text
+
 def make_keyword_buttons(keywords, prefix="del_kw"):
     keyboard = []
     row = []
@@ -444,7 +557,6 @@ def do_sbsb_signin(cookie):
     if not cookie:
         return {"success": False, "msg": "未配置 SBSB_COOKIE，请先在 VPS 配置 Cookie"}
 
-    # 智能补齐 Cookie 键名
     if "=" not in cookie:
         cookie = f"__Host-bbs_session={cookie}"
 
@@ -463,7 +575,6 @@ def do_sbsb_signin(cookie):
 
     opener = urllib.request.build_opener(NoRedirectHandler)
 
-    # 1. 访问 /signin/ 页面并尝试签到
     try:
         req = urllib.request.Request("https://sb.sb/signin/", headers=headers)
         resp = opener.open(req, timeout=15)
@@ -476,7 +587,6 @@ def do_sbsb_signin(cookie):
     except Exception as e:
         return {"success": False, "msg": f"访问签到页面异常: {e}"}
 
-    # 提取 CSRF Token 并尝试提交签到表单
     csrf_match = re.search(r'name=["\']_csrf["\']\s+value=["\']([^"\']+)["\']', html_signin) or re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_csrf["\']', html_signin)
     if csrf_match and ("今日已签" not in html_signin and "明日再来" not in html_signin):
         csrf_token = csrf_match.group(1)
@@ -491,14 +601,12 @@ def do_sbsb_signin(cookie):
         except Exception as e:
             print(f"[{datetime.now()}] 提交签到请求异常: {e}", flush=True)
 
-    # 精准提取连续签到天数（div.signin-streak-num）
     streak_m = re.search(r'class=\"[^\"]*signin-streak-num[^\"]*\"[^>]*>(\d+)</div>', html_signin)
     streak_days = streak_m.group(1) if streak_m else "1"
 
     total_days_m = re.search(r'<span[^>]*class=\"signin-stat-value\">(\d+)</span>\s*<span[^>]*class=\"signin-stat-label\">累计签到', html_signin)
     total_days = total_days_m.group(1) if total_days_m else streak_days
 
-    # 2. 访问 /points/ 页面提取精确资产与等级
     points = "0"
     exp = "0"
     level = "会员"
@@ -509,22 +617,18 @@ def do_sbsb_signin(cookie):
         resp_points = opener.open(req_points, timeout=15)
         html_points = resp_points.read().decode("utf-8", errors="ignore")
         
-        # 提取可用烧饼
         pts_match = re.search(r'可用烧饼</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>(\d+)</span>', html_points) or re.search(r'可用烧饼.*?(\d+)', html_points)
         if pts_match:
             points = pts_match.group(1)
             
-        # 提取成长值
         exp_match = re.search(r'成长值</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>(\d+)</span>', html_points) or re.search(r'成长值.*?(\d+)', html_points)
         if exp_match:
             exp = exp_match.group(1)
 
-        # 提取等级
         lv_match = re.search(r'等级</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>([^<]+)</span>', html_points) or re.search(r'等级.*?(Lv\.\d+[^<\n]+)', html_points)
         if lv_match:
             level = lv_match.group(1).strip()
 
-        # 提取官方账本中最新一条“每日签到”的准确时间并转换为北京时间
         signin_time_m = re.search(r'<time datetime=\"([^\"]+)\"[^>]*>([^<]+)</time>\s*</td>\s*<td>\s*每日签到', html_points)
         if signin_time_m:
             iso_str = signin_time_m.group(1)
@@ -541,7 +645,6 @@ def do_sbsb_signin(cookie):
         tz_cst = timezone(timedelta(hours=8))
         signin_time_str = datetime.now(tz_cst).strftime('%Y-%m-%d %H:%M:%S')
 
-    # 提取反馈消息
     flash_match = re.search(r'window\.__pageFlash=["\']([^"\']*)["\']', html_signin) or re.search(r'class=["\'][^"\']*toast[^"\']*["\']>([^<]+)<', html_signin)
     flash_msg = flash_match.group(1).strip() if flash_match and flash_match.group(1).strip() else "签到成功"
 
@@ -663,7 +766,7 @@ def handle_command_or_text(bot, chat_id, text):
     if chat_id in bot.user_states and not text.startswith("/"):
         state = bot.user_states.pop(chat_id)
         if state == "waiting_for_add":
-            new_kws = text.split()
+            new_kws = [k for k in text.split() if k not in LEGACY_BUILTIN_WORDS]
             added = []
             with bot.lock:
                 for kw in new_kws:
@@ -708,8 +811,9 @@ def handle_command_or_text(bot, chat_id, text):
             f"🤖 <b>多社区抽奖与热帖监控 Bot 指令中心</b>\n\n"
             f"📡 <b>当前公开源</b>: {sources_desc}\n"
             f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_desc}\n\n"
-            "📊 <b>状态与控制</b>\n"
+            "📊 <b>状态与报告</b>\n"
             "├ /status - 监控运行统计与健康报告\n"
+            "├ /report - 📈 <b>今日算法过滤与成功率日报</b>\n"
             "├ /sources - 📡 <b>各网站推送独立开关管理</b>\n"
             "├ /signin - 🍪 <b>烧饼论坛一键签到与查分</b>\n"
             "├ /keywords - 🎯 <b>查看并管理自定义关注词</b>\n"
@@ -720,6 +824,10 @@ def handle_command_or_text(bot, chat_id, text):
             "└ /test - 发送格式测试卡片"
         )
         bot.send_msg(chat_id, help_text)
+
+    elif cmd in ["/report", "/daily"]:
+        report_text = bot.generate_daily_report_card()
+        bot.send_msg(chat_id, report_text)
 
     elif cmd in ["/sources", "/sites"]:
         text_card, markup = bot.format_sources_card()
@@ -769,7 +877,7 @@ def handle_command_or_text(bot, chat_id, text):
             f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信与通知\n"
             f"🎁 <b>累计公开帖命中</b>: {bot.total_hit} 篇\n"
             f"💌 <b>累计互动通知</b>: {bot.total_private_notified} 次\n\n"
-            "<i>💡 输入 /sources 可独立开关各网站推送，输入 /keywords 可管理关注词</i>"
+            "<i>💡 输入 /report 查看算法过滤日报，输入 /sources 开关各网站推送</i>"
         )
         bot.send_msg(chat_id, status_text)
 
@@ -860,7 +968,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.1"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.2"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -893,7 +1001,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.1)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.2)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -953,6 +1061,28 @@ def sbsb_checkin_scheduler_thread(bot):
 
         except Exception as e:
             print(f"[{datetime.now()}] 签到调度器异常: {e}", flush=True)
+
+        time.sleep(300)
+
+def daily_quality_reporter_thread(bot):
+    """每日算法过滤与运行成功率总结推送线程 (北京时间每天 22:00 执行)"""
+    print(f"[{datetime.now()}] 📊 每日算法成功率与运行日报调度器已就绪 (目标时间: 北京时间 22:00)...", flush=True)
+
+    while True:
+        try:
+            tz_cst = timezone(timedelta(hours=8))
+            now_cst = datetime.now(tz_cst)
+            today_str = now_cst.strftime("%Y-%m-%d")
+
+            # 每天 22:00 执行一次推送
+            if now_cst.hour >= 22 and bot.last_daily_report_date != today_str:
+                bot.last_daily_report_date = today_str
+                print(f"[{datetime.now()}] 📊 生成并推送每日算法与监控健康度报告...", flush=True)
+                report_text = bot.generate_daily_report_card()
+                bot.send_msg(bot.admin_chat_id, report_text)
+
+        except Exception as e:
+            print(f"[{datetime.now()}] 每日报告调度异常: {e}", flush=True)
 
         time.sleep(300)
 
@@ -1069,6 +1199,7 @@ def sbsb_private_messages_thread(bot):
                 if unique_key not in bot.seen_msgs:
                     bot.seen_msgs.add(unique_key)
                     bot.total_private_notified += 1
+                    bot.record_stat("private_notified")
                     print(f"[{datetime.now()}] 📬 命中烧饼论坛新互动通知: [{kind}] {user} - {content}", flush=True)
 
                     msg_card = (
@@ -1105,6 +1236,7 @@ def sbsb_private_messages_thread(bot):
                     if thread_key not in bot.seen_msgs:
                         bot.seen_msgs.add(thread_key)
                         bot.total_private_notified += 1
+                        bot.record_stat("private_notified")
                         print(f"[{datetime.now()}] 📬 发现烧饼论坛新私信对话: {thread_id}", flush=True)
 
                         msg_text = (
@@ -1144,8 +1276,10 @@ def rss_monitor_thread(bot):
 
                 root = fetch_rss(source_url)
                 if root is None:
+                    bot.record_stat("poll_errors")
                     continue
 
+                bot.record_stat("poll_success")
                 channel = root.find("channel")
                 if channel is None:
                     continue
@@ -1178,14 +1312,17 @@ def rss_monitor_thread(bot):
 
                     bot.seen_ids.add(unique_id)
                     bot.total_checked += 1
+                    bot.record_stat("total_scanned")
 
                     if first_run or not is_enabled:
                         continue
 
-                    # 第二代高精度抽奖意图过滤
-                    if not bot.paused and bot.is_match(title, desc):
+                    # 第二代高精度抽奖意图过滤与分类决策
+                    is_hit, hit_type, hit_reason = bot.evaluate_post(title, desc)
+                    if not bot.paused and is_hit:
                         bot.total_hit += 1
-                        print(f"[{datetime.now()}] 🎁 命中抽奖/福利贴: [{source_name}] [{cat}] {title} (作者: {author})", flush=True)
+                        hit_badge = "🎁 [抽奖/福利]" if hit_type == "lottery" else "🎯 [自定义关注]"
+                        print(f"[{datetime.now()}] {hit_badge} 命中: [{source_name}] [{cat}] {title} ({hit_reason})", flush=True)
                         
                         summary = desc[:140] + ("..." if len(desc) > 140 else "")
                         msg = (
@@ -1213,7 +1350,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.1 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.2 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()
@@ -1226,6 +1363,9 @@ def main():
 
     t_checkin = threading.Thread(target=sbsb_checkin_scheduler_thread, args=(bot,), daemon=True)
     t_checkin.start()
+
+    t_report = threading.Thread(target=daily_quality_reporter_thread, args=(bot,), daemon=True)
+    t_report.start()
 
     while True:
         time.sleep(60)

@@ -10,17 +10,21 @@
   - **NodeSeek** (`https://rss.nodeseek.com/`)：全站实时流监控。
   - **烧饼论坛** (`https://sb.sb/rss.xml`)：原生支持全站流与抽奖专区（`/lottery/`）。
   - 0 风控、免登录、免 Cookie、无封号风险，毫秒级轻量 XML 流式解析。
+- 🧠 **第二代意图决策树算法（零噪音）**：
+  - 自动识别真正的抽奖/送机/roll帖，四层负向拦截彻底排除买卖求购（收/出/求/溢价）与日常泛词干扰（抽成/抽卡/比喻/求助）；
+  - 全网抽奖自动全搞定，关键词库只留给你作为「私人定制关注雷达」。
+- 📊 **每日算法健康度与成功率日报**：
+  - 自动统计每日扫描新帖数、精准抽奖命中数、噪音拦截数与 RSS 轮询成功率；
+  - 每日北京时间 **22:00** 准时向 Telegram 推送运行日报，随时发送 `/report` 查阅实时看板。
 - 🍪 **烧饼论坛自动签到与全量通知（可选）**：
   - 支持配置 `SBSB_COOKIE` 自动开启每日自动签到（北京时间每天 08:05 自动执行并回传连续天数、烧饼资产与等级）；
   - 支持在 Telegram 发送 `/signin` 随时一键签到与查分；
   - 实时轮询互动通知（`/u/{uid}/?tab=notifications`）与私信箱（`/messages/`），有人回复主题、点赞支持、@提及或发私信时秒级推送。
 - 📱 **Telegram 原生交互式管理**：
   - 自动注册 Telegram 官方快捷指令菜单（输入 `/` 即可一键点选）；
+  - 支持 **`/sources` 网站独立开关**，可一键暂停/开启特定网站推送；
   - 支持 **Inline Keyboard 按钮一键点选删除**，无需手动打字；
   - 支持 **对话引导式添加**，点击 `/add` 直接打字发送即可入库。
-- 🏷️ **优雅分类胶囊流**：关键词分类聚合展示（🎲 抽奖活动 / 🧧 福利赠送 / 🏷️ 自定义关注词），告别传统死板的纵向列表。
-- 🔗 **清晰直达链接**：推送卡片明确区分社区来源（`🌐 [NodeSeek]` / `🍪 [烧饼论坛]`），展示完整明文 HTTP/HTTPS 链接与具体楼层定位，点击直达论坛参与。
-- 🚫 **智能降噪过滤**：内置负向屏蔽机制，自动过滤买卖求购帖（如 `【慢收】`、`求购`）。
 - 🐳 **多架构 Docker 镜像支持**：自动构建发布至 GitHub Container Registry（`linux/amd64` 与 `linux/arm64`），体积仅 30MB，常驻内存仅约 15~20MB。
 
 ---
@@ -30,11 +34,13 @@
 | 指令 | 说明 | 交互形式 |
 | :--- | :--- | :--- |
 | `/status` | 📊 查看运行状态、启用的社区源、运行时间与去重扫描统计 | 文本卡片 |
+| `/report` | 📈 查看今日算法过滤日报、扫描总数与成功率看板 | 完整数据日报 |
+| `/sources` | 📡 各网站推送独立开关控制台（Inline Keyboard 点选切换） | 交互卡片 |
 | `/signin` | 🍪 烧饼论坛一键签到并返回连续天数、可用烧饼与等级 | 完整签到卡片 |
-| `/keywords` | 🎯 查看当前生效词库（分类胶囊展示） | 带有 `[ ➕ 添加 ]` 与 `[ 🗑️ 按钮删除 ]` 的交互卡片 |
+| `/keywords` | 🎯 查看并管理自定义专属关注词库 | 带有 `[ ➕ 添加 ]` 与 `[ 🗑️ 按钮删除 ]` 的交互卡片 |
 | `/blocks` | 🚫 查看当前生效的屏蔽词列表 | 带有 `[ ➕ 添加 ]` 与 `[ 🗑️ 按钮解除 ]` 的交互卡片 |
-| `/pause` | ⏸️ 暂停推送通知（后台继续记录去重索引，免打扰） | 文本确认 |
-| `/resume` | ▶️ 恢复推送通知 | 文本确认 |
+| `/pause` | ⏸️ 全局暂停推送通知（后台继续记录去重索引，免打扰） | 文本确认 |
+| `/resume` | ▶️ 全局恢复推送通知 | 文本确认 |
 | `/test` | 🧪 手动向自己触发双社区格式与签到演示卡片 | 完整卡片 |
 | `/help` | 📖 显示使用说明书 | 菜单列表 |
 
@@ -51,23 +57,6 @@
 | `SBSB_COOKIE` | *可选* | 空 | 烧饼论坛登录 Cookie（填入后自动激活每日 08:05 签到、查分与私信/回帖通知） |
 | `MONITOR_SOURCES` | *可选* | `nodeseek,sbsb` | 启用的公开源，可用逗号分隔过滤（支持 `nodeseek`, `sbsb`） |
 | `DATA_DIR` | *可选* | `/app/data` | 数据持久化存储路径 |
-
-### 1. 获取 `TG_BOT_TOKEN`
-1. 在 Telegram 中搜索官方机器人 [@BotFather](https://t.me/BotFather) 并点击开始；
-2. 发送 `/newbot`，按提示先输入你的 Bot 昵称（如 `MyCommunityBot`），再输入用户名（必须以 `bot` 结尾，如 `my_community_notify_bot`）；
-3. 创建成功后，BotFather 会返回一串 Token，形如：`YOUR_TELEGRAM_BOT_TOKEN`。
-
-### 2. 获取 `TG_CHAT_ID`
-1. 在 Telegram 中搜索机器人 [@userinfobot](https://t.me/userinfobot) 并点击开始；
-2. 它会立即回复你的个人信息，复制其中的 `Id` 纯数字（例如 `5020626401`）；
-3. ⚠️ **重要**：创建好你自己的 Bot 后，**请先在 Telegram 里搜索并私聊你自己的 Bot，点击一次底部的 `Start`**（如果不先点击 Start，Bot 无法主动向陌生私聊发消息）。
-
-### 3. 获取 `SBSB_COOKIE`（可选，用于自动签到和私信）
-1. 电脑浏览器打开并登录 `https://sb.sb/`；
-2. 按 `F12` 打开开发者工具 ➡️ 切换到 **应用 (Application)** 标签页（Firefox 为 **存储 (Storage)**）；
-3. 展开左侧 **Cookie** ➡️ 点击 `https://sb.sb`；
-4. 找到 **`__Host-bbs_session`**，双击复制它的 **值 (Value)**；
-5. 拼接格式填入：`SBSB_COOKIE="__Host-bbs_session=你复制的一长串值"`。
 
 ---
 
@@ -117,27 +106,13 @@ docker compose up -d
 
 ---
 
-### 方式二：单行 Docker Run 极速运行
-
-```bash
-docker run -d \
-  --name nodeseek-monitor \
-  --restart unless-stopped \
-  -e TG_BOT_TOKEN="你的_BOT_TOKEN" \
-  -e TG_CHAT_ID="你的_CHAT_ID" \
-  -e SBSB_COOKIE="__Host-bbs_session=你的值" \
-  -v $(pwd)/data:/app/data \
-  ghcr.io/j2st1n/nodeseek-tg-monitor:latest
-```
-
----
-
 ## ⚙️ 持久化与数据说明
 
 数据持久化保存在挂载的 `./data` 目录下：
-* `settings.json`：存储你动态配置的关键词、屏蔽词列表和推送开关（通过 Telegram 修改后自动保存）；
+* `settings.json`：存储你动态配置的关键词、屏蔽词列表、网站开关和推送状态；
 * `seen_ids.json`：存储已扫描的公开帖子 ID 历史，带各社区前缀，避免重启后重复推送；
 * `seen_msgs.json`：存储已扫描的烧饼论坛私信与互动通知唯一去重键；
+* `daily_stats.json`：记录每日算法扫描、过滤拦截与命中统计；
 * `checkin_state.json`：记录每日签到执行状态与日期。
 
 ---

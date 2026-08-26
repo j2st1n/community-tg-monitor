@@ -37,14 +37,14 @@ DEFAULT_SOURCES = [
 DEFAULT_POLL_INTERVAL = 30
 DEFAULT_PRIVATE_INTERVAL = 45
 
-# 默认关键词库（精准组合，避免单字误伤）
+# 默认关键词库（精准词组）
 DEFAULT_KEYWORDS = [
     "抽奖", "抽", "福利", "roll", "Roll", "ROLL",
     "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "送小鸡", "送机器", "送码",
     "口令", "红包", "开奖", "盖楼", "中奖", "白嫖"
 ]
 
-DEFAULT_BLOCKWORDS = ["收", "求", "买", "询", "出", "出出", "出台", "出个", "出只"]
+DEFAULT_BLOCKWORDS = ["收", "求", "买", "询", "出", "出出", "出台", "出个", "出只", "求购", "慢收", "溢价", "剩余价值"]
 
 BOT_COMMANDS = [
     {"command": "status", "description": "📊 监控状态与运行统计"},
@@ -115,7 +115,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.7"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.0"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -219,7 +219,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.7"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.0"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -250,7 +250,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.7"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.0"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -266,7 +266,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.7"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.0"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -275,25 +275,78 @@ class BotManager:
             return False
 
     def is_match(self, title, desc):
+        """第二代智能意图过滤与抽奖特征决策树算法"""
         clean_t = clean_title_prefix(title)
-        with self.lock:
-            # 1. 屏蔽词前缀与内容过滤（自动支持 【出】、【收】 等）
-            for bw in self.blockwords:
-                if bw:
-                    if clean_t.startswith(bw) or title.startswith(bw):
-                        return False
 
-            # 2. 标题赠送语法直通（如 '送只小鸡', '送一台' 等以送开头的帖子）
-            if clean_t.startswith("送") and not clean_t.startswith("送中"):
+        with self.lock:
+            # 1. 第一层：硬性否定（买卖、求购、交易前缀拦截）
+            for bw in self.blockwords:
+                if bw and (clean_t.startswith(bw) or title.startswith(bw)):
+                    return False
+
+            # 交易强特征拦截
+            if any(w in title for w in ['剩余价值', '求收', '收个', '出个全新', '求一个', '求推荐', '收一台', '出台', '出只', '慢出', '慢收', '带价']):
+                return False
+
+            # 2. 第二层：非抽奖意图词过滤（排除新闻抽成、游戏抽卡、打比方、求助、教程等）
+            anti_intent_words = [
+                '抽成', '抽水', '抽烟', '抽风', '抽空', '抽卡', '抽签', '抽检', '抽屉', '抽走',
+                '如抽奖', '像抽奖', '当抽奖', '中奖了', '中过奖', '怎么填写', '怎么填', '如何填',
+                '如何获得', '如何免费', '怎样免费', '推荐入坑', '的选择', '有套路吗', '清退', '谈判'
+            ]
+            if any(w in title for w in anti_intent_words):
+                return False
+
+            # 3. 疑问句拦截（标题以疑问词/问号结尾且没有显式抽奖标签）
+            if re.search(r'(吗|么|呢|？|\?)$', title.strip()) and not re.search(r'[【\[〖]抽奖[】\]〗]', title):
+                if any(qw in title for qw in ['怎么', '如何', '还能', '有没有', '谁有', '什么好', '哪个好', '推荐']):
+                    return False
+
+            # 4. 第三层：黄金强特征（Gold Match - 确凿的抽奖/福利/送机标识）
+            gold_patterns = [
+                r'^[【\[〖\s]*抽奖',
+                r'[【\[〖]抽奖[】\]〗]',
+                r'抽奖[🎉🔥🎁]',
+                r'[🎉🔥🎁]抽奖',
+                r'抽\s*\d+\s*(?:台|个|只|位|份|张|条|组|\$|刀|元|u|U)',
+                r'抽(?:一台|一个|只小鸡|台小鸡|机器|激活码|兑换码|体验金|年付|月付)',
+                r'抽(?:选|出|送)\s*\d+',
+                r'盖楼抽',
+                r'回帖抽',
+                r'评论区?留.*?(?:抽|送)',
+                r'\broll\s*(?:一个|一台|只|点|\d+|机|个)',
+                r'^[【\[\(（〖\s]*(?:送|免费送|白送|直接送|送只|送个|送台|送一)',
+                r'自选一台',
+                r'口令红包',
+                r'先到先得'
+            ]
+            for pat in gold_patterns:
+                if re.search(pat, title, re.IGNORECASE):
+                    return True
+
+            # 5. 组合特征：标题含有“抽奖”或“福利”并伴随送/开奖动作
+            if '抽奖' in title and any(k in title for k in ['开奖', '送', '第一期', '第二期', '第三期', '见者有份', '福利', '奖品', '吧', '活动']):
                 return True
 
-            # 3. 清理正文中的常见网络术语干扰（如 '送中', '没送中', '未送中', '推送' 等）
-            clean_desc = desc.replace("送中", "").replace("没送中", "").replace("未送中", "").replace("推送", "").replace("发送", "")
-
-            # 4. 关键词扫描
-            for kw in self.keywords:
-                if kw and (kw in title or kw in clean_desc):
+            # 6. 自定义用户关键词（支持用户在 TG 中手动添加的个性化关注词）
+            custom_kws = [k for k in self.keywords if k not in BUILTIN_LOTTERY and k not in BUILTIN_WELFARE]
+            for c_kw in custom_kws:
+                if c_kw and (c_kw in title or c_kw in desc):
                     return True
+
+            # 7. 正文强抽奖规则检测
+            desc_clean = desc.replace('送中', '').replace('没送中', '').replace('未送中', '')
+            desc_lottery_patterns = [
+                r'评论区?留.*?(?:抽|送|中奖)',
+                r'本帖(?:回复|盖楼).*?抽',
+                r'开奖时间.*?(?:\d+|随机)',
+                r'随机抽\s*\d+\s*(?:位|个|台)',
+                r'截止时间.*?(?:抽|开奖)',
+            ]
+            for pat in desc_lottery_patterns:
+                if re.search(pat, desc_clean):
+                    return True
+
         return False
 
     def format_keywords_card(self):
@@ -814,7 +867,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.7"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.0"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -847,7 +900,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.7)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.0)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1094,7 +1147,6 @@ def rss_monitor_thread(bot):
                 source_url = source["url"]
                 author_tag = source.get("author_tag")
 
-                # 如果用户关闭了该网站的推送，依然记录去重以防重新开启时炸群，但跳过推送
                 is_enabled = bot.is_source_enabled(source_id)
 
                 root = fetch_rss(source_url)
@@ -1137,6 +1189,7 @@ def rss_monitor_thread(bot):
                     if first_run or not is_enabled:
                         continue
 
+                    # 第二代高精度抽奖意图过滤
                     if not bot.paused and bot.is_match(title, desc):
                         bot.total_hit += 1
                         print(f"[{datetime.now()}] 🎁 命中抽奖/福利贴: [{source_name}] [{cat}] {title} (作者: {author})", flush=True)
@@ -1167,7 +1220,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.7 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.0 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

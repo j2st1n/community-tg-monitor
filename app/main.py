@@ -48,11 +48,12 @@ DEFAULT_BLOCKWORDS = ["收", "求", "买", "询", "出", "出出", "出台", "�
 
 BOT_COMMANDS = [
     {"command": "status", "description": "📊 监控状态与运行统计"},
+    {"command": "sources", "description": "📡 监控网站独立推送开关"},
     {"command": "signin", "description": "🍪 烧饼论坛一键签到与查分"},
     {"command": "keywords", "description": "🎯 查看并管理监控关键词"},
     {"command": "blocks", "description": "🚫 查看并管理屏蔽词"},
-    {"command": "pause", "description": "⏸️ 暂停推送"},
-    {"command": "resume", "description": "▶️ 恢复推送"},
+    {"command": "pause", "description": "⏸️ 全局暂停推送"},
+    {"command": "resume", "description": "▶️ 全局恢复推送"},
     {"command": "test", "description": "🧪 发送测试卡片"},
     {"command": "help", "description": "📖 显示帮助菜单"}
 ]
@@ -85,8 +86,8 @@ class BotManager:
         self.last_cookie_warn_time = 0
         
         self.user_states = {}
-        
         self.sources = list(DEFAULT_SOURCES)
+        self.source_states = {s["id"]: True for s in DEFAULT_SOURCES}
         
         # 支持通过环境变量过滤启用的源
         enabled_source_ids = os.environ.get("MONITOR_SOURCES", "").strip().lower()
@@ -109,7 +110,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.5"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.6"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -131,6 +132,11 @@ class BotManager:
                     self.blockwords = data.get("blockwords", DEFAULT_BLOCKWORDS)
                     self.poll_interval = data.get("poll_interval", DEFAULT_POLL_INTERVAL)
                     self.paused = data.get("paused", False)
+                    saved_source_states = data.get("source_states", {})
+                    for s in self.sources:
+                        sid = s["id"]
+                        if sid in saved_source_states:
+                            self.source_states[sid] = bool(saved_source_states[sid])
                     return
             except Exception as e:
                 print(f"[{datetime.now()}] 读取 settings.json 异常: {e}", flush=True)
@@ -139,6 +145,7 @@ class BotManager:
         self.blockwords = list(DEFAULT_BLOCKWORDS)
         self.poll_interval = DEFAULT_POLL_INTERVAL
         self.paused = False
+        self.source_states = {s["id"]: True for s in self.sources}
         self.save_settings()
 
     def save_settings(self):
@@ -147,10 +154,22 @@ class BotManager:
             "keywords": self.keywords,
             "blockwords": self.blockwords,
             "poll_interval": self.poll_interval,
-            "paused": self.paused
+            "paused": self.paused,
+            "source_states": self.source_states
         }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def is_source_enabled(self, source_id):
+        with self.lock:
+            return self.source_states.get(source_id, True)
+
+    def toggle_source(self, source_id):
+        with self.lock:
+            current = self.source_states.get(source_id, True)
+            self.source_states[source_id] = not current
+            self.save_settings()
+            return self.source_states[source_id]
 
     def load_seen_ids(self):
         if os.path.exists(SEEN_IDS_FILE):
@@ -195,7 +214,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.5"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.6"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -226,7 +245,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.5"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.6"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -242,7 +261,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.5"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/3.6"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -330,6 +349,29 @@ class BotManager:
                 ]
             ]
         }
+        return text, markup
+
+    def format_sources_card(self):
+        with self.lock:
+            lines = []
+            buttons = []
+            for s in self.sources:
+                sid = s["id"]
+                sname = s["name"]
+                sicon = s["icon"]
+                is_on = self.source_states.get(sid, True)
+                status_str = "🟢 开启推送中" if is_on else "🔴 已暂停推送"
+                lines.append(f"{sicon} <b>{sname}</b>: {status_str}")
+                btn_text = f"{sicon} {sname}: {'开启 🟢' if is_on else '关闭 🔴'}"
+                buttons.append([{"text": btn_text, "callback_data": f"toggle_src:{sid}"}])
+
+        body = "\n".join(lines)
+        text = (
+            "📡 <b>监控网站独立推送开关控制台</b>\n\n"
+            f"{body}\n\n"
+            "<i>💡 点击下方按钮可独立开启/关闭对应网站的抽奖与新帖推送：</i>"
+        )
+        markup = {"inline_keyboard": buttons}
         return text, markup
 
 def make_keyword_buttons(keywords, prefix="del_kw"):
@@ -476,7 +518,15 @@ def handle_callback_query(bot, query):
 
     print(f"[{datetime.now()}] 🔘 点击按钮: '{data}'", flush=True)
 
-    if data == "menu:add_kw":
+    if data.startswith("toggle_src:"):
+        target_src = data.split("toggle_src:", 1)[1]
+        new_state = bot.toggle_source(target_src)
+        state_text = "开启 🟢" if new_state else "关闭 🔴"
+        bot.answer_callback_query(query_id, f"已切换为: {state_text}")
+        text, markup = bot.format_sources_card()
+        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
+
+    elif data == "menu:add_kw":
         bot.user_states[chat_id] = "waiting_for_add"
         bot.answer_callback_query(query_id, "请直接输入新关键词")
         bot.send_msg(chat_id, "➕ <b>请输入你想添加的监控关键词：</b>\n<i>（支持一次输入多个词，用空格分隔，例如：<code>搬瓦工 9929 传家宝</code>）</i>")
@@ -603,17 +653,22 @@ def handle_command_or_text(bot, chat_id, text):
             f"🤖 <b>多社区抽奖与热帖监控 Bot 指令中心</b>\n\n"
             f"📡 <b>当前公开源</b>: {sources_desc}\n"
             f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_desc}\n\n"
-            "📊 <b>状态与签到</b>\n"
+            "📊 <b>状态与独立开关</b>\n"
             "├ /status - 监控运行统计与健康报告\n"
+            "├ /sources - 📡 <b>各网站推送独立开关管理</b>\n"
             "├ /signin - 🍪 <b>烧饼论坛一键签到与查分</b>\n"
             "├ /keywords - 🎯 <b>查看并交互式管理监控关键词</b>\n"
             "└ /blocks - 🚫 <b>查看并交互式管理屏蔽词</b>\n\n"
             "⚙️ <b>快捷控制</b>\n"
-            "├ /pause - 暂停推送通知 (免打扰)\n"
-            "├ /resume - 恢复推送通知\n"
+            "├ /pause - 全局暂停推送通知 (免打扰)\n"
+            "├ /resume - 全局恢复推送通知\n"
             "└ /test - 发送格式测试卡片"
         )
         bot.send_msg(chat_id, help_text)
+
+    elif cmd in ["/sources", "/sites"]:
+        text_card, markup = bot.format_sources_card()
+        bot.send_msg(chat_id, text_card, reply_markup=markup)
 
     elif cmd in ["/signin", "/checkin"]:
         bot.send_msg(chat_id, "⏳ <b>正在连接烧饼论坛执行签到与资产同步...</b>")
@@ -637,21 +692,29 @@ def handle_command_or_text(bot, chat_id, text):
         uptime = datetime.now() - bot.start_time
         hours, remainder = divmod(int(uptime.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
-        sources_list = "\n".join([f"  • {s['icon']} <b>{s['name']}</b> ({s['url']})" for s in bot.sources])
+        
+        sources_list = []
+        for s in bot.sources:
+            sid = s["id"]
+            is_on = bot.source_states.get(sid, True)
+            status_tag = "🟢 开启" if is_on else "🔴 已暂停"
+            sources_list.append(f"  • {s['icon']} <b>{s['name']}</b> ({status_tag})")
+        sources_text = "\n".join(sources_list)
+
         sbsb_private_status = "🟢 实时运行中（含每日 08:05 自动签到与通知）" if bot.sbsb_cookie else "⚪ 未配置 SBSB_COOKIE"
         status_text = (
             "📊 <b>社区监控守护状态报告</b>\n\n"
             f"⏱️ <b>运行时间</b>: {hours}小时 {minutes}分 {seconds}秒\n"
-            f"🔔 <b>推送状态</b>: {'⏸️ 已暂停' if bot.paused else '▶️ 运行中'}\n"
+            f"🔔 <b>全局推送状态</b>: {'⏸️ 全局已暂停' if bot.paused else '▶️ 运行中'}\n"
             f"📡 <b>轮询周期</b>: 每 {bot.poll_interval} 秒\n"
-            f"🌐 <b>已启用公开监控源 ({len(bot.sources)})</b>:\n{sources_list}\n"
+            f"🌐 <b>监控网站状态 ({len(bot.sources)})</b>:\n{sources_text}\n"
             f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_status}\n"
             f"🎯 <b>监控关键词数</b>: {len(bot.keywords)} 个\n"
             f"🚫 <b>屏蔽词数</b>: {len(bot.blockwords)} 个\n"
             f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信与通知\n"
             f"🎁 <b>累计公开帖命中</b>: {bot.total_hit} 篇\n"
             f"💌 <b>累计互动通知</b>: {bot.total_private_notified} 次\n\n"
-            "<i>💡 输入 /signin 可一键手动签到，输入 /keywords 可管理监控词库</i>"
+            "<i>💡 输入 /sources 可独立开关各网站推送，输入 /signin 可一键签到查分</i>"
         )
         bot.send_msg(chat_id, status_text)
 
@@ -689,13 +752,13 @@ def handle_command_or_text(bot, chat_id, text):
         with bot.lock:
             bot.paused = True
             bot.save_settings()
-        bot.send_msg(chat_id, "⏸️ <b>监控推送已暂停！</b>\n（后台继续记录去重索引，免打扰，发送 /resume 可随时恢复）")
+        bot.send_msg(chat_id, "⏸️ <b>全局监控推送已暂停！</b>\n（后台继续记录去重索引，免打扰，发送 /resume 可随时恢复）")
 
     elif cmd == "/resume":
         with bot.lock:
             bot.paused = False
             bot.save_settings()
-        bot.send_msg(chat_id, "▶️ <b>监控推送已恢复正常运行！</b>")
+        bot.send_msg(chat_id, "▶️ <b>全局监控推送已恢复正常运行！</b>")
 
     elif cmd == "/test":
         test_msg_ns = (
@@ -742,7 +805,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.5"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/3.6"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -775,7 +838,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.5)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/3.6)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1022,6 +1085,9 @@ def rss_monitor_thread(bot):
                 source_url = source["url"]
                 author_tag = source.get("author_tag")
 
+                # 如果用户关闭了该网站的推送，依然记录去重以防重新开启时炸群，但跳过推送
+                is_enabled = bot.is_source_enabled(source_id)
+
                 root = fetch_rss(source_url)
                 if root is None:
                     continue
@@ -1059,7 +1125,7 @@ def rss_monitor_thread(bot):
                     bot.seen_ids.add(unique_id)
                     bot.total_checked += 1
 
-                    if first_run:
+                    if first_run or not is_enabled:
                         continue
 
                     if not bot.paused and bot.is_match(title, desc):
@@ -1092,7 +1158,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.5 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v3.6 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

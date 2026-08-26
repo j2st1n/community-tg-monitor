@@ -4,6 +4,7 @@ import sys
 import time
 import json
 import re
+import traceback
 import threading
 import urllib.request
 import urllib.parse
@@ -172,7 +173,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.3"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.5"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -277,7 +278,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.3"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.5"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -308,7 +309,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.3"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.5"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -324,7 +325,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.3"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.5"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -500,21 +501,20 @@ class BotManager:
         return text, markup
 
     def generate_daily_report_card(self):
-        """生成每日运行统计与算法成功率报告卡片"""
-        with self.lock:
-            stats = dict(self.daily_stats)
-            uptime = datetime.now() - self.start_time
-            hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-            minutes, seconds = divmod(remainder, 60)
-            
-            scanned = stats.get("total_scanned", 0)
-            lottery_hits = stats.get("lottery_hits", 0)
-            custom_hits = stats.get("custom_hits", 0)
-            trade_blocked = stats.get("trade_blocked", 0)
-            noise_blocked = stats.get("noise_blocked", 0)
-            priv_notified = stats.get("private_notified", 0)
-            poll_success = stats.get("poll_success", 0)
-            poll_errors = stats.get("poll_errors", 0)
+        """生成每日运行统计与算法成功率报告卡片（无锁安全快照）"""
+        stats = dict(self.daily_stats)
+        uptime = datetime.now() - self.start_time
+        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        scanned = stats.get("total_scanned", 0)
+        lottery_hits = stats.get("lottery_hits", 0)
+        custom_hits = stats.get("custom_hits", 0)
+        trade_blocked = stats.get("trade_blocked", 0)
+        noise_blocked = stats.get("noise_blocked", 0)
+        priv_notified = stats.get("private_notified", 0)
+        poll_success = stats.get("poll_success", 0)
+        poll_errors = stats.get("poll_errors", 0)
 
         total_polls = poll_success + poll_errors
         success_rate = (poll_success / total_polls * 100) if total_polls > 0 else 100.0
@@ -811,165 +811,172 @@ def handle_command_or_text(bot, chat_id, text):
     cmd = raw_cmd.split('@')[0]
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    print(f"[{datetime.now()}] 📨 处理指令: '{text}'", flush=True)
+    print(f"[{datetime.now()}] 📨 处理指令: '{text}' (识别命令: {cmd})", flush=True)
 
-    if cmd in ["/start", "/help"]:
-        sources_desc = "、".join([f"{s['icon']} {s['name']}" for s in bot.sources])
-        sbsb_private_desc = "🟢 已启用" if bot.sbsb_cookie else "⚪ 未配置 (可选)"
-        help_text = (
-            f"🤖 <b>多社区抽奖与热帖监控 Bot 指令中心</b>\n\n"
-            f"📡 <b>当前公开源</b>: {sources_desc}\n"
-            f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_desc}\n\n"
-            "📊 <b>状态与报告</b>\n"
-            "├ /status - 监控运行统计与健康报告\n"
-            "├ /report - 📈 <b>今日算法过滤与成功率日报</b>\n"
-            "├ /sources - 📡 <b>各网站推送独立开关管理</b>\n"
-            "├ /signin - 🍪 <b>烧饼论坛一键签到与查分</b>\n"
-            "├ /keywords - 🎯 <b>查看并管理自定义关注词</b>\n"
-            "└ /blocks - 🚫 <b>查看并交互式管理屏蔽词</b>\n\n"
-            "⚙️ <b>快捷控制</b>\n"
-            "├ /pause - 全局暂停推送通知 (免打扰)\n"
-            "├ /resume - 全局恢复推送通知\n"
-            "└ /test - 发送格式测试卡片"
-        )
-        bot.send_msg(chat_id, help_text)
+    try:
+        if cmd in ["/start", "/help"]:
+            sources_desc = "、".join([f"{s['icon']} {s['name']}" for s in bot.sources])
+            sbsb_private_desc = "🟢 已启用" if bot.sbsb_cookie else "⚪ 未配置 (可选)"
+            help_text = (
+                f"🤖 <b>多社区抽奖与热帖监控 Bot 指令中心</b>\n\n"
+                f"📡 <b>当前公开源</b>: {sources_desc}\n"
+                f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_desc}\n\n"
+                "📊 <b>状态与报告</b>\n"
+                "├ /status - 监控运行统计与健康报告\n"
+                "├ /report - 📈 <b>今日算法过滤与成功率日报</b>\n"
+                "├ /sources - 📡 <b>各网站推送独立开关管理</b>\n"
+                "├ /signin - 🍪 <b>烧饼论坛一键签到与查分</b>\n"
+                "├ /keywords - 🎯 <b>查看并管理自定义关注词</b>\n"
+                "└ /blocks - 🚫 <b>查看并交互式管理屏蔽词</b>\n\n"
+                "⚙️ <b>快捷控制</b>\n"
+                "├ /pause - 全局暂停推送通知 (免打扰)\n"
+                "├ /resume - 全局恢复推送通知\n"
+                "└ /test - 发送格式测试卡片"
+            )
+            res = bot.send_msg(chat_id, help_text)
+            print(f"[{datetime.now()}] ✅ 指令 {cmd} 发送结果: {res}", flush=True)
 
-    elif cmd in ["/report", "/daily"]:
-        report_text = bot.generate_daily_report_card()
-        bot.send_msg(chat_id, report_text)
+        elif cmd in ["/report", "/daily"]:
+            report_text = bot.generate_daily_report_card()
+            res = bot.send_msg(chat_id, report_text)
+            print(f"[{datetime.now()}] ✅ 指令 {cmd} 发送结果: {res}", flush=True)
 
-    elif cmd in ["/sources", "/sites"]:
-        text_card, markup = bot.format_sources_card()
-        bot.send_msg(chat_id, text_card, reply_markup=markup)
+        elif cmd in ["/sources", "/sites"]:
+            text_card, markup = bot.format_sources_card()
+            res = bot.send_msg(chat_id, text_card, reply_markup=markup)
+            print(f"[{datetime.now()}] ✅ 指令 {cmd} 发送结果: {res}", flush=True)
 
-    elif cmd in ["/signin", "/checkin"]:
-        bot.send_msg(chat_id, "⏳ <b>正在连接烧饼论坛执行签到与资产同步...</b>")
-        res = do_sbsb_signin(bot.sbsb_cookie)
-        if res.get("success"):
-            status_badge = "✅ 签到成功！" if not res.get("already") else "✨ 今日已完成签到"
-            report_msg = (
-                f"🍪 <b>烧饼论坛 (sb.sb) 签到与资产报告</b>\n\n"
-                f"🎉 <b>签到状态</b>: {status_badge}\n"
-                f"📅 <b>连续签到</b>: <b>{res.get('consecutive_days')}</b> (累计: {res.get('total_days')})\n"
-                f"💰 <b>可用烧饼</b>: <b>{res.get('total_points')}</b>\n"
-                f"⭐ <b>成长等级</b>: <b>{res.get('level')}</b> (成长值: {res.get('exp')})\n"
-                f"🕒 <b>签到时间</b>: {res.get('signin_time')}\n\n"
+        elif cmd in ["/signin", "/checkin"]:
+            bot.send_msg(chat_id, "⏳ <b>正在连接烧饼论坛执行签到与资产同步...</b>")
+            res = do_sbsb_signin(bot.sbsb_cookie)
+            if res.get("success"):
+                status_badge = "✅ 签到成功！" if not res.get("already") else "✨ 今日已完成签到"
+                report_msg = (
+                    f"🍪 <b>烧饼论坛 (sb.sb) 签到与资产报告</b>\n\n"
+                    f"🎉 <b>签到状态</b>: {status_badge}\n"
+                    f"📅 <b>连续签到</b>: <b>{res.get('consecutive_days')}</b> (累计: {res.get('total_days')})\n"
+                    f"💰 <b>可用烧饼</b>: <b>{res.get('total_points')}</b>\n"
+                    f"⭐ <b>成长等级</b>: <b>{res.get('level')}</b> (成长值: {res.get('exp')})\n"
+                    f"🕒 <b>签到时间</b>: {res.get('signin_time')}\n\n"
+                    "<i>💡 系统将在每日 08:05 (UTC+8) 自动执行定时签到</i>"
+                )
+                bot.send_msg(chat_id, report_msg)
+            else:
+                bot.send_msg(chat_id, f"⚠️ <b>烧饼论坛签到失败</b>\n原因: <code>{res.get('msg')}</code>")
+
+        elif cmd == "/status":
+            uptime = datetime.now() - bot.start_time
+            hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            
+            sources_list = []
+            for s in bot.sources:
+                sid = s["id"]
+                is_on = bot.source_states.get(sid, True)
+                status_tag = "🟢 开启" if is_on else "🔴 已暂停"
+                sources_list.append(f"  • {s['icon']} <b>{s['name']}</b> ({status_tag})")
+            sources_text = "\n".join(sources_list)
+
+            sbsb_private_status = "🟢 实时运行中（含每日 08:05 自动签到与通知）" if bot.sbsb_cookie else "⚪ 未配置 SBSB_COOKIE"
+            status_text = (
+                "📊 <b>社区监控守护状态报告</b>\n\n"
+                f"⏱️ <b>运行时间</b>: {hours}小时 {minutes}分 {seconds}秒\n"
+                f"🔔 <b>全局推送状态</b>: {'⏸️ 全局已暂停' if bot.paused else '▶️ 运行中'}\n"
+                f"📡 <b>轮询周期</b>: 每 {bot.poll_interval} 秒\n"
+                f"🌐 <b>监控网站状态 ({len(bot.sources)})</b>:\n{sources_text}\n"
+                f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_status}\n"
+                f"🎯 <b>自定义关注词数</b>: {len(bot.keywords)} 个\n"
+                f"🚫 <b>屏蔽词数</b>: {len(bot.blockwords)} 个\n"
+                f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信与通知\n"
+                f"🎁 <b>累计公开帖命中</b>: {bot.total_hit} 篇\n"
+                f"💌 <b>累计互动通知</b>: {bot.total_private_notified} 次\n\n"
+                "<i>💡 输入 /report 查看算法过滤日报，输入 /sources 开关各网站推送</i>"
+            )
+            bot.send_msg(chat_id, status_text)
+
+        elif cmd in ["/keywords", "/list", "/add", "/del"]:
+            if cmd == "/add" and arg:
+                new_kws = [k for k in arg.split() if k not in LEGACY_BUILTIN_WORDS]
+                added = []
+                with bot.lock:
+                    for kw in new_kws:
+                        if kw not in bot.keywords:
+                            bot.keywords.append(kw)
+                            added.append(kw)
+                    bot.save_settings()
+                text_card, markup = bot.format_keywords_card()
+                bot.send_msg(chat_id, f"✅ 已添加：<code>{', '.join(added)}</code>\n\n{text_card}", reply_markup=markup)
+                return
+            
+            text_card, markup = bot.format_keywords_card()
+            bot.send_msg(chat_id, text_card, reply_markup=markup)
+
+        elif cmd in ["/blocks", "/block", "/delblock"]:
+            if cmd == "/block" and arg:
+                with bot.lock:
+                    if arg not in bot.blockwords:
+                        bot.blockwords.append(arg)
+                        bot.save_settings()
+                text_card, markup = bot.format_blocks_card()
+                bot.send_msg(chat_id, f"🚫 已添加屏蔽：<code>{arg}</code>\n\n{text_card}", reply_markup=markup)
+                return
+                
+            text_card, markup = bot.format_blocks_card()
+            bot.send_msg(chat_id, text_card, reply_markup=markup)
+
+        elif cmd == "/pause":
+            with bot.lock:
+                bot.paused = True
+                bot.save_settings()
+            bot.send_msg(chat_id, "⏸️ <b>全局监控推送已暂停！</b>\n（后台继续记录去重索引，免打扰，发送 /resume 可随时恢复）")
+
+        elif cmd == "/resume":
+            with bot.lock:
+                bot.paused = False
+                bot.save_settings()
+            bot.send_msg(chat_id, "▶️ <b>全局监控推送已恢复正常运行！</b>")
+
+        elif cmd == "/test":
+            test_msg_ns = (
+                "🎁 <b>🌐 [NodeSeek] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
+                "📌 <b>标题</b>: [日常] 测试抽奖演示贴\n"
+                "👤 <b>作者</b>: NodeSeeker  |  🏷️ <b>板块</b>: #daily\n"
+                "📝 <b>摘要</b>: 这是一条手动触发的 NodeSeek 测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
+                "🔗 <b>链接</b>: https://www.nodeseek.com/post-889000-1"
+            )
+            test_msg_sb = (
+                "🎁 <b>🍪 [烧饼论坛] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
+                "📌 <b>标题</b>: 〖抽奖〗新人见面礼｜抽 10 台 LAXPre Nano，65 折循环续费\n"
+                "👤 <b>作者</b>: 烧饼用户  |  🏷️ <b>板块</b>: #优惠\n"
+                "📝 <b>摘要</b>: 这是一条手动触发的烧饼论坛测试卡片，抽奖专区与全站流已全部接入监控。\n\n"
+                "🔗 <b>链接</b>: https://sb.sb/t/931/"
+            )
+            test_msg_pm = (
+                "📬 <b>🍪 [烧饼论坛] 收到新的互动通知！</b> (演示卡片)\n\n"
+                "👤 <b>用户</b>: 西风  |  🏷️ <b>类型</b>: #回复\n"
+                "💬 <b>内容</b>: 回复了你的主题：人多了就卡，毕竟这个程序很简单 @Xshell #2\n"
+                "🕒 <b>时间</b>: 3小时前\n\n"
+                "🔗 <b>直达链接</b>: https://sb.sb/t/2028/?reply_id=25485"
+            )
+            test_msg_signin = (
+                "🍪 <b>烧饼论坛 (sb.sb) 签到与资产报告</b> (演示卡片)\n\n"
+                "🎉 <b>签到状态</b>: ✨ 今日已完成签到\n"
+                "📅 <b>连续签到</b>: <b>2 天</b> (累计: 3 天)\n"
+                "💰 <b>可用烧饼</b>: <b>45 饼</b>\n"
+                "⭐ <b>成长等级</b>: <b>Lv.2 新手上路</b> (成长值: 61)\n"
+                "🕒 <b>签到时间</b>: 2026-08-26 09:55:35\n\n"
                 "<i>💡 系统将在每日 08:05 (UTC+8) 自动执行定时签到</i>"
             )
-            bot.send_msg(chat_id, report_msg)
+            bot.send_msg(chat_id, test_msg_ns, disable_preview=False)
+            bot.send_msg(chat_id, test_msg_sb, disable_preview=False)
+            bot.send_msg(chat_id, test_msg_pm, disable_preview=False)
+            bot.send_msg(chat_id, test_msg_signin, disable_preview=False)
+        
         else:
-            bot.send_msg(chat_id, f"⚠️ <b>烧饼论坛签到失败</b>\n原因: <code>{res.get('msg')}</code>")
-
-    elif cmd == "/status":
-        uptime = datetime.now() - bot.start_time
-        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        
-        sources_list = []
-        for s in bot.sources:
-            sid = s["id"]
-            is_on = bot.source_states.get(sid, True)
-            status_tag = "🟢 开启" if is_on else "🔴 已暂停"
-            sources_list.append(f"  • {s['icon']} <b>{s['name']}</b> ({status_tag})")
-        sources_text = "\n".join(sources_list)
-
-        sbsb_private_status = "🟢 实时运行中（含每日 08:05 自动签到与通知）" if bot.sbsb_cookie else "⚪ 未配置 SBSB_COOKIE"
-        status_text = (
-            "📊 <b>社区监控守护状态报告</b>\n\n"
-            f"⏱️ <b>运行时间</b>: {hours}小时 {minutes}分 {seconds}秒\n"
-            f"🔔 <b>全局推送状态</b>: {'⏸️ 全局已暂停' if bot.paused else '▶️ 运行中'}\n"
-            f"📡 <b>轮询周期</b>: 每 {bot.poll_interval} 秒\n"
-            f"🌐 <b>监控网站状态 ({len(bot.sources)})</b>:\n{sources_text}\n"
-            f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_status}\n"
-            f"🎯 <b>自定义关注词数</b>: {len(bot.keywords)} 个\n"
-            f"🚫 <b>屏蔽词数</b>: {len(bot.blockwords)} 个\n"
-            f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信与通知\n"
-            f"🎁 <b>累计公开帖命中</b>: {bot.total_hit} 篇\n"
-            f"💌 <b>累计互动通知</b>: {bot.total_private_notified} 次\n\n"
-            "<i>💡 输入 /report 查看算法过滤日报，输入 /sources 开关各网站推送</i>"
-        )
-        bot.send_msg(chat_id, status_text)
-
-    elif cmd in ["/keywords", "/list", "/add", "/del"]:
-        if cmd == "/add" and arg:
-            new_kws = [k for k in arg.split() if k not in LEGACY_BUILTIN_WORDS]
-            added = []
-            with bot.lock:
-                for kw in new_kws:
-                    if kw not in bot.keywords:
-                        bot.keywords.append(kw)
-                        added.append(kw)
-                bot.save_settings()
-            text_card, markup = bot.format_keywords_card()
-            bot.send_msg(chat_id, f"✅ 已添加：<code>{', '.join(added)}</code>\n\n{text_card}", reply_markup=markup)
-            return
-        
-        text_card, markup = bot.format_keywords_card()
-        bot.send_msg(chat_id, text_card, reply_markup=markup)
-
-    elif cmd in ["/blocks", "/block", "/delblock"]:
-        if cmd == "/block" and arg:
-            with bot.lock:
-                if arg not in bot.blockwords:
-                    bot.blockwords.append(arg)
-                    bot.save_settings()
-            text_card, markup = bot.format_blocks_card()
-            bot.send_msg(chat_id, f"🚫 已添加屏蔽：<code>{arg}</code>\n\n{text_card}", reply_markup=markup)
-            return
-            
-        text_card, markup = bot.format_blocks_card()
-        bot.send_msg(chat_id, text_card, reply_markup=markup)
-
-    elif cmd == "/pause":
-        with bot.lock:
-            bot.paused = True
-            bot.save_settings()
-        bot.send_msg(chat_id, "⏸️ <b>全局监控推送已暂停！</b>\n（后台继续记录去重索引，免打扰，发送 /resume 可随时恢复）")
-
-    elif cmd == "/resume":
-        with bot.lock:
-            bot.paused = False
-            bot.save_settings()
-        bot.send_msg(chat_id, "▶️ <b>全局监控推送已恢复正常运行！</b>")
-
-    elif cmd == "/test":
-        test_msg_ns = (
-            "🎁 <b>🌐 [NodeSeek] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
-            "📌 <b>标题</b>: [日常] 测试抽奖演示贴\n"
-            "👤 <b>作者</b>: NodeSeeker  |  🏷️ <b>板块</b>: #daily\n"
-            "📝 <b>摘要</b>: 这是一条手动触发的 NodeSeek 测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
-            "🔗 <b>链接</b>: https://www.nodeseek.com/post-889000-1"
-        )
-        test_msg_sb = (
-            "🎁 <b>🍪 [烧饼论坛] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
-            "📌 <b>标题</b>: 〖抽奖〗新人见面礼｜抽 10 台 LAXPre Nano，65 折循环续费\n"
-            "👤 <b>作者</b>: 烧饼用户  |  🏷️ <b>板块</b>: #优惠\n"
-            "📝 <b>摘要</b>: 这是一条手动触发的烧饼论坛测试卡片，抽奖专区与全站流已全部接入监控。\n\n"
-            "🔗 <b>链接</b>: https://sb.sb/t/931/"
-        )
-        test_msg_pm = (
-            "📬 <b>🍪 [烧饼论坛] 收到新的互动通知！</b> (演示卡片)\n\n"
-            "👤 <b>用户</b>: 西风  |  🏷️ <b>类型</b>: #回复\n"
-            "💬 <b>内容</b>: 回复了你的主题：人多了就卡，毕竟这个程序很简单 @Xshell #2\n"
-            "🕒 <b>时间</b>: 3小时前\n\n"
-            "🔗 <b>直达链接</b>: https://sb.sb/t/2028/?reply_id=25485"
-        )
-        test_msg_signin = (
-            "🍪 <b>烧饼论坛 (sb.sb) 签到与资产报告</b> (演示卡片)\n\n"
-            "🎉 <b>签到状态</b>: ✨ 今日已完成签到\n"
-            "📅 <b>连续签到</b>: <b>2 天</b> (累计: 3 天)\n"
-            "💰 <b>可用烧饼</b>: <b>45 饼</b>\n"
-            "⭐ <b>成长等级</b>: <b>Lv.2 新手上路</b> (成长值: 61)\n"
-            "🕒 <b>签到时间</b>: 2026-08-26 09:55:35\n\n"
-            "<i>💡 系统将在每日 08:05 (UTC+8) 自动执行定时签到</i>"
-        )
-        bot.send_msg(chat_id, test_msg_ns, disable_preview=False)
-        bot.send_msg(chat_id, test_msg_sb, disable_preview=False)
-        bot.send_msg(chat_id, test_msg_pm, disable_preview=False)
-        bot.send_msg(chat_id, test_msg_signin, disable_preview=False)
-    
-    else:
-        bot.send_msg(chat_id, f"❓ 未识别的指令：<code>{cmd}</code>\n请输入 /help 查看可用指令列表。")
+            bot.send_msg(chat_id, f"❓ 未识别的指令：<code>{cmd}</code>\n请输入 /help 查看可用指令列表。")
+    except Exception as ie:
+        print(f"[{datetime.now()}] ❌ 执行指令 {cmd} 发生内部异常: {ie}", flush=True)
+        traceback.print_exc()
 
 def telegram_polling_thread(bot):
     offset = 0
@@ -977,7 +984,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.3"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.5"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -1010,7 +1017,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.3)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.5)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1326,7 +1333,6 @@ def rss_monitor_thread(bot):
                     if first_run or not is_enabled:
                         continue
 
-                    # 第二代高精度抽奖意图过滤与分类决策（带来源、版块与全量审计）
                     is_hit, hit_type, hit_reason = bot.evaluate_post(source_name, cat, title, desc)
                     if not bot.paused and is_hit:
                         bot.total_hit += 1
@@ -1359,7 +1365,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.3 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.5 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

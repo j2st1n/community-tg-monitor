@@ -173,7 +173,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.5"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.6"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -278,7 +278,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.5"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.6"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -309,7 +309,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.5"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.6"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -325,7 +325,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.5"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.6"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -335,18 +335,18 @@ class BotManager:
 
     def evaluate_post(self, source_name, cat, title, desc):
         """
-        第二代智能意图过滤与决策树评估器（带全量审计日志输出）
+        全口径高精度抽奖、福利与红包意图决策树算法（带全量审计日志输出）
         返回: (is_matched: bool, category_tag: str, reason: str)
         """
         clean_t = clean_title_prefix(title)
 
         with self.lock:
-            # 0. 烧饼论坛原生抽奖标签/专区直通车 (Authority Match)
+            # 0. 烧饼论坛官方抽奖专区/标签绝对直通 (Authority Match)
             if source_name == "烧饼论坛" and (cat == "抽奖" or "抽奖" in cat or clean_t.startswith("〖抽奖〗")):
                 self.record_stat("lottery_hits")
                 return True, "lottery", "命中烧饼论坛官方抽奖专区/标签"
 
-            # 1. 第一层：硬性否定（买卖、求购、交易前缀拦截）
+            # 1. 第一层：硬性买卖求购过滤
             for bw in self.blockwords:
                 if bw and (clean_t.startswith(bw) or title.startswith(bw)):
                     self.record_stat("trade_blocked")
@@ -377,22 +377,25 @@ class BotManager:
                     print(f"[{datetime.now()}] 🚫 [噪音拦截] [{source_name}] {title} (疑问咨询句式)", flush=True)
                     return False, "noise_blocked", "命中疑问咨询句式"
 
-            # 4. 第三层：黄金强特征（Gold Match - 确凿的抽奖/福利/送机标识）
+            # 4. 第三层：黄金强特征（全口径覆盖：抽/送/roll/红包/福利）
             gold_patterns = [
                 r'^[【\[〖\s]*抽奖',
                 r'[【\[〖]抽奖[】\]〗]',
                 r'抽奖[🎉🔥🎁]',
                 r'[🎉🔥🎁]抽奖',
-                r'抽\s*\d+\s*(?:台|个|只|位|份|张|条|组|\$|刀|元|u|U)',
-                r'抽(?:一台|一个|只小鸡|台小鸡|机器|激活码|兑换码|体验金|年付|月付)',
-                r'抽(?:选|出|送)\s*\d+',
+                r'抽\s*(?:\d+|[一两三四五六七八九十]|台|个|只|位|份|张|条|组|点|些|波|\$|刀|元|u|U|烧饼)',
+                r'抽(?:一台|一个|只小鸡|台小鸡|机器|激活码|兑换码|体验金|年付|月付|烧饼|域名)',
+                r'抽(?:选|出|送)\s*(?:\d+|[一两三四五六七八九十])',
+                r'^[【\[\(（〖\s]*(?:送|免费送|白送|直接送|送只|送个|送台|送一|送点|送波|发红包|开红包)',
+                r'给大家送点',
+                r'红包(?:帖|第[一二三四五六七八九十\d]+弹)',
+                r'玩(?:一玩)?红包',
+                r'口令红包',
                 r'盖楼抽',
                 r'回帖抽',
                 r'评论区?留.*?(?:抽|送)',
-                r'\broll\s*(?:一个|一台|只|点|\d+|机|个)',
-                r'^[【\[\(（〖\s]*(?:送|免费送|白送|直接送|送只|送个|送台|送一)',
+                r'\broll\s*(?:一个|一台|只|点|\d+|机|个|波)',
                 r'自选一台',
-                r'口令红包',
                 r'先到先得'
             ]
             for pat in gold_patterns:
@@ -415,6 +418,7 @@ class BotManager:
             desc_lottery_patterns = [
                 r'评论区?留.*?(?:抽|送|中奖)',
                 r'本帖(?:回复|盖楼).*?抽',
+                r'开\s*\d+\s*份红包',
                 r'开奖时间.*?(?:\d+|随机)',
                 r'随机抽\s*\d+\s*(?:位|个|台)',
                 r'截止时间.*?(?:抽|开奖)',
@@ -984,7 +988,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.5"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.6"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -1017,7 +1021,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.5)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.6)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1333,6 +1337,7 @@ def rss_monitor_thread(bot):
                     if first_run or not is_enabled:
                         continue
 
+                    # 第二代全口径高精度抽奖意图过滤与分类决策
                     is_hit, hit_type, hit_reason = bot.evaluate_post(source_name, cat, title, desc)
                     if not bot.paused and is_hit:
                         bot.total_hit += 1
@@ -1365,7 +1370,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.5 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.6 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

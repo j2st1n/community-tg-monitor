@@ -173,7 +173,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.6"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.7"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -278,7 +278,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.6"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.7"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -309,7 +309,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.6"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.7"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -325,7 +325,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.6"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.7"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -536,7 +536,8 @@ class BotManager:
             "📈 <b>多社区监控每日运行与算法健康度报告</b>\n"
             f"📅 <b>统计日期</b>: <code>{date_str}</code> (周期: 24h)\n\n"
             "🔍 <b>公开帖子扫描与过滤分析</b>\n"
-            f"• 📊 <b>总扫描新帖</b>: <b>{scanned}</b> 篇\n"
+            f"• 📊 <b>全网新发主题</b>: <b>{scanned}</b> 篇\n"
+            f"• 📡 <b>高频轮询巡检</b>: <b>{poll_success}</b> 轮次 (每30s双源扫描)\n"
             f"• 🎁 <b>精准抽奖命中</b>: <b>{lottery_hits}</b> 篇 (100% 决策树交付)\n"
             f"• 🏷️ <b>自定义词命中</b>: <b>{custom_hits}</b> 篇\n"
             f"• 🛡️ <b>噪音负向拦截</b>: <b>{total_blocked}</b> 篇 (交易 {trade_blocked} / 噪音 {noise_blocked})\n"
@@ -545,7 +546,7 @@ class BotManager:
             f"• {src_line}\n\n"
             "⚙️ <b>系统守护健康度</b>\n"
             f"• ⏱️ <b>连续运行</b>: {hours}小时 {minutes}分\n"
-            f"• 📡 <b>RSS 轮询成功率</b>: <b>{success_rate:.1f}%</b> ({poll_success} 成功 / {poll_errors} 异常)\n"
+            f"• 📡 <b>RSS 巡检成功率</b>: <b>{success_rate:.1f}%</b> ({poll_success} 成功 / {poll_errors} 异常)\n"
             f"• 🎯 <b>已去重索引容量</b>: {len(self.seen_ids)} 篇帖 / {len(self.seen_msgs)} 条通知\n\n"
             "<i>💡 每日 22:00 (UTC+8) 自动总结推送，随时输入 /report 查阅实时数据</i>"
         )
@@ -988,7 +989,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.6"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.7"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -1021,7 +1022,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.6)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.7)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1370,7 +1371,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.6 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.7 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

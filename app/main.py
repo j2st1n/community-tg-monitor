@@ -172,7 +172,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.2"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.3"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -277,7 +277,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.2"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.3"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -308,7 +308,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.2"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.3"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -324,7 +324,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.2"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.3"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -332,25 +332,32 @@ class BotManager:
         except Exception:
             return False
 
-    def evaluate_post(self, title, desc):
+    def evaluate_post(self, source_name, cat, title, desc):
         """
-        第二代智能意图过滤与决策树评估器
+        第二代智能意图过滤与决策树评估器（带全量审计日志输出）
         返回: (is_matched: bool, category_tag: str, reason: str)
         """
         clean_t = clean_title_prefix(title)
 
         with self.lock:
+            # 0. 烧饼论坛原生抽奖标签/专区直通车 (Authority Match)
+            if source_name == "烧饼论坛" and (cat == "抽奖" or "抽奖" in cat or clean_t.startswith("〖抽奖〗")):
+                self.record_stat("lottery_hits")
+                return True, "lottery", "命中烧饼论坛官方抽奖专区/标签"
+
             # 1. 第一层：硬性否定（买卖、求购、交易前缀拦截）
             for bw in self.blockwords:
                 if bw and (clean_t.startswith(bw) or title.startswith(bw)):
                     self.record_stat("trade_blocked")
+                    print(f"[{datetime.now()}] 🚫 [买卖拦截] [{source_name}] {title} (前缀: {bw})", flush=True)
                     return False, "trade_blocked", f"命中买卖前缀 [{bw}]"
 
             if any(w in title for w in ['剩余价值', '求收', '收个', '出个全新', '求一个', '求推荐', '收一台', '出台', '出只', '慢出', '慢收', '带价']):
                 self.record_stat("trade_blocked")
+                print(f"[{datetime.now()}] 🚫 [买卖拦截] [{source_name}] {title} (交易词汇)", flush=True)
                 return False, "trade_blocked", "命中交易词汇"
 
-            # 2. 第二层：非抽奖意图词过滤
+            # 2. 第二层：非抽奖意图词过滤（商业新闻/抽卡/比喻/求助）
             anti_intent_words = [
                 '抽成', '抽水', '抽烟', '抽风', '抽空', '抽卡', '抽签', '抽检', '抽屉', '抽走',
                 '如抽奖', '像抽奖', '当抽奖', '中奖了', '中过奖', '怎么填写', '怎么填', '如何填',
@@ -359,12 +366,14 @@ class BotManager:
             for w in anti_intent_words:
                 if w in title:
                     self.record_stat("noise_blocked")
+                    print(f"[{datetime.now()}] 🚫 [噪音拦截] [{source_name}] {title} (意图干扰: {w})", flush=True)
                     return False, "noise_blocked", f"命中干扰意图 [{w}]"
 
             # 3. 疑问句拦截
             if re.search(r'(吗|么|呢|？|\?)$', title.strip()) and not re.search(r'[【\[〖]抽奖[】\]〗]', title):
                 if any(qw in title for qw in ['怎么', '如何', '还能', '有没有', '谁有', '什么好', '哪个好', '推荐']):
                     self.record_stat("noise_blocked")
+                    print(f"[{datetime.now()}] 🚫 [噪音拦截] [{source_name}] {title} (疑问咨询句式)", flush=True)
                     return False, "noise_blocked", "命中疑问咨询句式"
 
             # 4. 第三层：黄金强特征（Gold Match - 确凿的抽奖/福利/送机标识）
@@ -968,7 +977,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.2"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.3"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -1001,7 +1010,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.2)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.3)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1317,8 +1326,8 @@ def rss_monitor_thread(bot):
                     if first_run or not is_enabled:
                         continue
 
-                    # 第二代高精度抽奖意图过滤与分类决策
-                    is_hit, hit_type, hit_reason = bot.evaluate_post(title, desc)
+                    # 第二代高精度抽奖意图过滤与分类决策（带来源、版块与全量审计）
+                    is_hit, hit_type, hit_reason = bot.evaluate_post(source_name, cat, title, desc)
                     if not bot.paused and is_hit:
                         bot.total_hit += 1
                         hit_badge = "🎁 [抽奖/福利]" if hit_type == "lottery" else "🎯 [自定义关注]"
@@ -1350,7 +1359,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.2 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.3 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

@@ -83,7 +83,8 @@ class BotManager:
         self.sbsb_cookie = sbsb_cookie_val
         self.sbsb_uid = None
 
-        self.lock = threading.Lock()
+        # 使用可重入递归锁 RLock，彻底杜绝方法嵌套调用时的死锁 Bug
+        self.lock = threading.RLock()
         self.start_time = datetime.now()
         self.paused = False
         self.total_checked = 0
@@ -173,7 +174,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.7"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.8"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -278,7 +279,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.7"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.8"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -309,7 +310,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.7"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.8"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -325,7 +326,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.7"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.8"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -989,7 +990,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.7"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.8"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -1022,7 +1023,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.7)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.8)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1371,7 +1372,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.7 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.8 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

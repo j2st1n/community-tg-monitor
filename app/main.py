@@ -37,20 +37,17 @@ DEFAULT_SOURCES = [
 DEFAULT_POLL_INTERVAL = 30
 DEFAULT_PRIVATE_INTERVAL = 45
 
-# 默认关键词库（精准词组）
-DEFAULT_KEYWORDS = [
-    "抽奖", "抽", "福利", "roll", "Roll", "ROLL",
-    "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "送小鸡", "送机器", "送码",
-    "口令", "红包", "开奖", "盖楼", "中奖", "白嫖"
-]
+# 默认用户自定义关键词（初始为空，抽奖活动由内置决策树全自动监控）
+DEFAULT_KEYWORDS = []
 
+# 默认屏蔽词
 DEFAULT_BLOCKWORDS = ["收", "求", "买", "询", "出", "出出", "出台", "出个", "出只", "求购", "慢收", "溢价", "剩余价值"]
 
 BOT_COMMANDS = [
     {"command": "status", "description": "📊 监控状态与运行统计"},
     {"command": "sources", "description": "📡 监控网站独立推送开关"},
     {"command": "signin", "description": "🍪 烧饼论坛一键签到与查分"},
-    {"command": "keywords", "description": "🎯 查看并管理监控关键词"},
+    {"command": "keywords", "description": "🎯 查看并管理自定义关注词"},
     {"command": "blocks", "description": "🚫 查看并管理屏蔽词"},
     {"command": "pause", "description": "⏸️ 全局暂停推送"},
     {"command": "resume", "description": "▶️ 全局恢复推送"},
@@ -58,8 +55,12 @@ BOT_COMMANDS = [
     {"command": "help", "description": "📖 显示帮助菜单"}
 ]
 
-BUILTIN_LOTTERY = {"抽奖", "抽", "开奖", "中奖", "roll", "Roll", "ROLL", "盖楼"}
-BUILTIN_WELFARE = {"福利", "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "白嫖", "口令", "红包", "送小鸡", "送机器", "送码"}
+# 废弃的旧内置抽奖词集合（用于向后兼容自动清洗）
+LEGACY_BUILTIN_WORDS = {
+    "抽奖", "抽", "福利", "roll", "Roll", "ROLL",
+    "送只", "送个", "送台", "送一", "白送", "直接送", "先到先得", "免费送", "送小鸡", "送机器", "送码",
+    "口令", "红包", "开奖", "盖楼", "中奖", "白嫖", "免费"
+}
 
 def clean_title_prefix(title):
     """去除标题开头的括号和特殊标点符号，如 '【出】' -> '出】'"""
@@ -115,7 +116,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.1"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -133,7 +134,9 @@ class BotManager:
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.keywords = data.get("keywords", DEFAULT_KEYWORDS)
+                    raw_keywords = data.get("keywords", [])
+                    # 自动清理历史遗留的内置抽奖词，让用户词库回归纯净自定义
+                    self.keywords = [k for k in raw_keywords if k not in LEGACY_BUILTIN_WORDS]
                     self.blockwords = data.get("blockwords", DEFAULT_BLOCKWORDS)
                     self.poll_interval = data.get("poll_interval", DEFAULT_POLL_INTERVAL)
                     self.paused = data.get("paused", False)
@@ -219,7 +222,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.0"}
+                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.1"}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -250,7 +253,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.1"}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -266,7 +269,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.0"}
+            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.1"}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -302,7 +305,7 @@ class BotManager:
                 if any(qw in title for qw in ['怎么', '如何', '还能', '有没有', '谁有', '什么好', '哪个好', '推荐']):
                     return False
 
-            # 4. 第三层：黄金强特征（Gold Match - 确凿的抽奖/福利/送机标识）
+            # 4. 第三层：黄金强特征（Gold Match - 确凿的抽奖/福利/送机标识，自动全网监听）
             gold_patterns = [
                 r'^[【\[〖\s]*抽奖',
                 r'[【\[〖]抽奖[】\]〗]',
@@ -328,9 +331,8 @@ class BotManager:
             if '抽奖' in title and any(k in title for k in ['开奖', '送', '第一期', '第二期', '第三期', '见者有份', '福利', '奖品', '吧', '活动']):
                 return True
 
-            # 6. 自定义用户关键词（支持用户在 TG 中手动添加的个性化关注词）
-            custom_kws = [k for k in self.keywords if k not in BUILTIN_LOTTERY and k not in BUILTIN_WELFARE]
-            for c_kw in custom_kws:
+            # 6. 用户自定义专属关注词（在 TG 中通过 /keywords 添加的个性化特价/机型关注词）
+            for c_kw in self.keywords:
                 if c_kw and (c_kw in title or c_kw in desc):
                     return True
 
@@ -350,34 +352,25 @@ class BotManager:
         return False
 
     def format_keywords_card(self):
+        """纯粹的自定义专属关注词管理卡片"""
         with self.lock:
             kws = list(self.keywords)
-        
-        lottery = [k for k in kws if k in BUILTIN_LOTTERY]
-        welfare = [k for k in kws if k in BUILTIN_WELFARE and k not in lottery]
-        custom = [k for k in kws if k not in BUILTIN_LOTTERY and k not in BUILTIN_WELFARE]
 
-        sections = []
-        if lottery:
-            pills = " · ".join([f"<code>{k}</code>" for k in lottery])
-            sections.append(f"🎲 <b>抽奖活动</b> ({len(lottery)})\n{pills}")
-        if welfare:
-            pills = " · ".join([f"<code>{k}</code>" for k in welfare])
-            sections.append(f"🧧 <b>福利赠送</b> ({len(welfare)})\n{pills}")
-        if custom:
-            pills = " · ".join([f"<code>{k}</code>" for k in custom])
-            sections.append(f"🏷️ <b>自定义关注词</b> ({len(custom)})\n{pills}")
+        if kws:
+            pills = " · ".join([f"<code>{k}</code>" for k in kws])
+            body = f"🏷️ <b>正在关注的专属词</b> ({len(kws)} 个)\n{pills}"
+        else:
+            body = "<i>（暂无自定义词，点击下方按钮添加你想关注的商家、机型或线路）</i>"
 
-        body = "\n\n".join(sections) if sections else "<i>（暂无关键词，请点击下方添加）</i>"
         text = (
-            f"🎯 <b>社区监控关键词库</b> (共 {len(kws)} 个)\n\n"
+            f"🎯 <b>自定义关注词库</b> (共 {len(kws)} 个)\n\n"
             f"{body}\n\n"
-            "<i>💡 命中以上任意词的新帖都会即时推送提醒</i>"
+            "💡 <i>提示：全网抽奖、送机与福利贴由内置智能引擎全自动监听，无需在此添加。此处仅用于添加你关心的特价、商家或捡漏词（如 <code>搬瓦工</code>、<code>9929</code>、<code>传家宝</code>）。</i>"
         )
         markup = {
             "inline_keyboard": [
                 [
-                    {"text": "➕ 添加新词", "callback_data": "menu:add_kw"},
+                    {"text": "➕ 添加关注词", "callback_data": "menu:add_kw"},
                     {"text": "🗑️ 按钮删除词", "callback_data": "menu:del_kw"}
                 ]
             ]
@@ -591,16 +584,16 @@ def handle_callback_query(bot, query):
     elif data == "menu:add_kw":
         bot.user_states[chat_id] = "waiting_for_add"
         bot.answer_callback_query(query_id, "请直接输入新关键词")
-        bot.send_msg(chat_id, "➕ <b>请输入你想添加的监控关键词：</b>\n<i>（支持一次输入多个词，用空格分隔，例如：<code>搬瓦工 9929 传家宝</code>）</i>")
+        bot.send_msg(chat_id, "➕ <b>请输入你想添加的自定义关注词：</b>\n<i>（支持一次输入多个词，用空格分隔，例如：<code>搬瓦工 9929 传家宝</code>）</i>")
 
     elif data == "menu:del_kw":
         bot.answer_callback_query(query_id, "请点击按钮删除")
         with bot.lock:
             kws = list(bot.keywords)
         if not kws:
-            bot.edit_msg_text(chat_id, msg_id, "⚠️ <b>当前没有可删除的关键词。</b>")
+            bot.edit_msg_text(chat_id, msg_id, "⚠️ <b>当前没有已添加的自定义关注词。</b>")
         else:
-            text = f"🗑️ <b>请点击下方按钮删除对应的监控词（共 {len(kws)} 个）：</b>"
+            text = f"🗑️ <b>请点击下方按钮删除对应的关注词（共 {len(kws)} 个）：</b>"
             bot.edit_msg_text(chat_id, msg_id, text, reply_markup=make_keyword_buttons(kws, "del_kw"))
 
     elif data == "menu:add_bw":
@@ -635,7 +628,7 @@ def handle_callback_query(bot, query):
                 bot.answer_callback_query(query_id, "该词已不存在")
             
             if bot.keywords:
-                text = f"🗑️ <b>请点击下方按钮删除对应的监控词（剩余 {len(bot.keywords)} 个）：</b>"
+                text = f"🗑️ <b>请点击下方按钮删除对应的关注词（剩余 {len(bot.keywords)} 个）：</b>"
                 bot.edit_msg_text(chat_id, msg_id, text, reply_markup=make_keyword_buttons(bot.keywords, "del_kw"))
             else:
                 text, markup = bot.format_keywords_card()
@@ -680,7 +673,7 @@ def handle_command_or_text(bot, chat_id, text):
                 bot.save_settings()
             if added:
                 msg_text, markup = bot.format_keywords_card()
-                bot.send_msg(chat_id, f"✅ <b>已成功添加 {len(added)} 个监控词：</b>\n<code>{', '.join(added)}</code>\n\n{msg_text}", reply_markup=markup)
+                bot.send_msg(chat_id, f"✅ <b>已成功添加 {len(added)} 个关注词：</b>\n<code>{', '.join(added)}</code>\n\n{msg_text}", reply_markup=markup)
             else:
                 bot.send_msg(chat_id, "⚠️ 所输入的关键词均已存在。")
             return
@@ -715,11 +708,11 @@ def handle_command_or_text(bot, chat_id, text):
             f"🤖 <b>多社区抽奖与热帖监控 Bot 指令中心</b>\n\n"
             f"📡 <b>当前公开源</b>: {sources_desc}\n"
             f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_desc}\n\n"
-            "📊 <b>状态与独立开关</b>\n"
+            "📊 <b>状态与控制</b>\n"
             "├ /status - 监控运行统计与健康报告\n"
             "├ /sources - 📡 <b>各网站推送独立开关管理</b>\n"
             "├ /signin - 🍪 <b>烧饼论坛一键签到与查分</b>\n"
-            "├ /keywords - 🎯 <b>查看并交互式管理监控关键词</b>\n"
+            "├ /keywords - 🎯 <b>查看并管理自定义关注词</b>\n"
             "└ /blocks - 🚫 <b>查看并交互式管理屏蔽词</b>\n\n"
             "⚙️ <b>快捷控制</b>\n"
             "├ /pause - 全局暂停推送通知 (免打扰)\n"
@@ -771,18 +764,18 @@ def handle_command_or_text(bot, chat_id, text):
             f"📡 <b>轮询周期</b>: 每 {bot.poll_interval} 秒\n"
             f"🌐 <b>监控网站状态 ({len(bot.sources)})</b>:\n{sources_text}\n"
             f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_status}\n"
-            f"🎯 <b>监控关键词数</b>: {len(bot.keywords)} 个\n"
+            f"🎯 <b>自定义关注词数</b>: {len(bot.keywords)} 个\n"
             f"🚫 <b>屏蔽词数</b>: {len(bot.blockwords)} 个\n"
             f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信与通知\n"
             f"🎁 <b>累计公开帖命中</b>: {bot.total_hit} 篇\n"
             f"💌 <b>累计互动通知</b>: {bot.total_private_notified} 次\n\n"
-            "<i>💡 输入 /sources 可独立开关各网站推送，输入 /signin 可一键签到查分</i>"
+            "<i>💡 输入 /sources 可独立开关各网站推送，输入 /keywords 可管理关注词</i>"
         )
         bot.send_msg(chat_id, status_text)
 
     elif cmd in ["/keywords", "/list", "/add", "/del"]:
         if cmd == "/add" and arg:
-            new_kws = arg.split()
+            new_kws = [k for k in arg.split() if k not in LEGACY_BUILTIN_WORDS]
             added = []
             with bot.lock:
                 for kw in new_kws:
@@ -867,7 +860,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.1"})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -900,7 +893,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.0)"}
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.1)"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1220,7 +1213,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.0 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.1 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

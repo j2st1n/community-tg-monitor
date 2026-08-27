@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import json
+import html
 import re
 import traceback
 import threading
@@ -11,7 +12,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
-APP_VERSION = "4.9"
+APP_VERSION = "4.10"
 APP_USER_AGENT = f"Community-Monitor-Bot/{APP_VERSION}"
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
@@ -166,7 +167,9 @@ class BotManager:
             "poll_success": 0,
             "poll_errors": 0,
             "delivery_success": 0,
-            "delivery_errors": 0
+            "delivery_errors": 0,
+            "redpacket_poll_success": 0,
+            "redpacket_poll_errors": 0
         }
         if os.path.exists(DAILY_STATS_FILE):
             try:
@@ -201,7 +204,9 @@ class BotManager:
                     "poll_success": 0,
                     "poll_errors": 0,
                     "delivery_success": 0,
-                    "delivery_errors": 0
+                    "delivery_errors": 0,
+                    "redpacket_poll_success": 0,
+                    "redpacket_poll_errors": 0
                 }
             self.daily_stats[key] = self.daily_stats.get(key, 0) + count
             self.save_daily_stats()
@@ -583,6 +588,8 @@ class BotManager:
         poll_errors = stats.get("poll_errors", 0)
         delivery_success = stats.get("delivery_success", 0)
         delivery_errors = stats.get("delivery_errors", 0)
+        redpacket_poll_success = stats.get("redpacket_poll_success", 0)
+        redpacket_poll_errors = stats.get("redpacket_poll_errors", 0)
 
         total_polls = poll_success + poll_errors
         success_rate = (poll_success / total_polls * 100) if total_polls > 0 else 100.0
@@ -612,6 +619,7 @@ class BotManager:
             "⚙️ <b>系统守护健康度</b>\n"
             f"• ⏱️ <b>连续运行</b>: {hours}小时 {minutes}分\n"
             f"• 📡 <b>RSS 巡检成功率</b>: <b>{success_rate:.1f}%</b> ({poll_success} 成功 / {poll_errors} 异常)\n"
+            f"• 🧧 <b>烧饼红包徽标巡检</b>: {redpacket_poll_success} 成功 / {redpacket_poll_errors} 异常\n"
             f"• 🎯 <b>已去重索引容量</b>: {len(self.seen_ids)} 篇帖 / {len(self.seen_msgs)} 条通知\n\n"
             "<i>💡 每日 22:00 (UTC+8) 自动总结推送，随时输入 /report 查阅实时数据</i>"
         )
@@ -1096,6 +1104,102 @@ def fetch_rss(url):
         print(f"[{datetime.now()}] RSS 拉取异常 ({url}): {e}", flush=True)
         return None
 
+
+def parse_sbsb_redpacket_topics(page_html):
+    """从烧饼论坛主题列表解析带官方红包徽标的帖子。"""
+    blocks = re.findall(
+        r'<li[^>]*class=["\'][^"\']*post-item[^"\']*["\'][^>]*>'
+        r'(.*?)(?=<li[^>]*class=["\'][^"\']*post-item|</ul>)',
+        page_html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    topics = []
+    seen_links = set()
+    for block in blocks:
+        if not re.search(r'class=["\'][^"\']*redpacket-badge', block, re.IGNORECASE):
+            continue
+
+        title_match = re.search(
+            r'<a[^>]*class=["\'][^"\']*post-title[^"\']*["\'][^>]*'
+            r'href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not title_match:
+            continue
+
+        link = urllib.parse.urljoin("https://sb.sb/", html.unescape(title_match.group(1)))
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+
+        title = html.unescape(re.sub(r'<[^>]+>', ' ', title_match.group(2)))
+        title = re.sub(r'\s+', ' ', title).strip()
+
+        author_match = re.search(
+            r'<a[^>]*href=["\']/u/\d+/?["\'][^>]*>(.*?)</a>',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
+        author = "烧饼用户"
+        if author_match:
+            author = html.unescape(re.sub(r'<[^>]+>', ' ', author_match.group(1)))
+            author = re.sub(r'\s+', ' ', author).strip() or author
+
+        category_match = re.search(
+            r'<a[^>]*href=["\']/go/[^"\']+/?["\'][^>]*>(.*?)</a>',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
+        category = "综合"
+        if category_match:
+            category = html.unescape(re.sub(r'<[^>]+>', ' ', category_match.group(1)))
+            category = re.sub(r'\s+', ' ', category).strip() or category
+
+        topics.append({
+            "title": title,
+            "link": link,
+            "author": author,
+            "category": category,
+        })
+    return topics
+
+
+def fetch_sbsb_redpacket_topics(cookie=""):
+    req = urllib.request.Request(
+        "https://sb.sb/",
+        headers={
+            "User-Agent": f"Mozilla/5.0 (CommunityFeed/{APP_VERSION})",
+            "Cookie": cookie,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return parse_sbsb_redpacket_topics(resp.read().decode("utf-8", errors="ignore"))
+    except Exception as e:
+        print(f"[{datetime.now()}] 烧饼红包徽标拉取异常: {e}", flush=True)
+        return None
+
+
+def deliver_public_match(bot, source_name, source_icon, category, title, author, desc, link, hit_type, hit_reason):
+    bot.total_hit += 1
+    hit_badge = "🎁 [抽奖/福利]" if hit_type == "lottery" else "🎯 [自定义关注]"
+    print(f"[{datetime.now()}] {hit_badge} 命中: [{source_name}] [{category}] {title} ({hit_reason})", flush=True)
+
+    summary = desc[:140] + ("..." if len(desc) > 140 else "")
+    msg = (
+        f"🎁 <b>{source_icon} [{source_name}] 发现抽奖/福利新帖！</b>\n\n"
+        f"📌 <b>标题</b>: {title}\n"
+        f"👤 <b>作者</b>: {author}  |  🏷️ <b>板块</b>: #{category}\n"
+        f"📝 <b>摘要</b>: {summary}\n\n"
+        f"🔗 <b>链接</b>: {link}"
+    )
+    delivered = bot.send_msg(bot.admin_chat_id, msg, disable_preview=False)
+    bot.record_stat("delivery_success" if delivered else "delivery_errors")
+    if not delivered:
+        print(f"[{datetime.now()}] ❌ Telegram 推送失败: [{source_name}] {title}", flush=True)
+    return delivered
+
 def sbsb_checkin_scheduler_thread(bot):
     """烧饼论坛每日自动签到调度线程 (北京时间每天 08:05 执行)"""
     if not bot.sbsb_cookie:
@@ -1404,22 +1508,45 @@ def rss_monitor_thread(bot):
                     # 第二代全口径高精度抽奖意图过滤与分类决策
                     is_hit, hit_type, hit_reason = bot.evaluate_post(source_name, cat, title, desc)
                     if not bot.paused and is_hit:
-                        bot.total_hit += 1
-                        hit_badge = "🎁 [抽奖/福利]" if hit_type == "lottery" else "🎯 [自定义关注]"
-                        print(f"[{datetime.now()}] {hit_badge} 命中: [{source_name}] [{cat}] {title} ({hit_reason})", flush=True)
-                        
-                        summary = desc[:140] + ("..." if len(desc) > 140 else "")
-                        msg = (
-                            f"🎁 <b>{source_icon} [{source_name}] 发现抽奖/福利新帖！</b>\n\n"
-                            f"📌 <b>标题</b>: {title}\n"
-                            f"👤 <b>作者</b>: {author}  |  🏷️ <b>板块</b>: #{cat}\n"
-                            f"📝 <b>摘要</b>: {summary}\n\n"
-                            f"🔗 <b>链接</b>: {link}"
+                        deliver_public_match(
+                            bot, source_name, source_icon, cat, title, author,
+                            desc, link, hit_type, hit_reason,
                         )
-                        delivered = bot.send_msg(bot.admin_chat_id, msg, disable_preview=False)
-                        bot.record_stat("delivery_success" if delivered else "delivery_errors")
-                        if not delivered:
-                            print(f"[{datetime.now()}] ❌ Telegram 推送失败: [{source_name}] {title}", flush=True)
+
+            # RSS 不暴露登录可见帖的红包属性，因此额外读取首页官方红包徽标。
+            if any(source["id"] == "sbsb" for source in bot.sources):
+                redpacket_topics = fetch_sbsb_redpacket_topics(bot.sbsb_cookie)
+                if redpacket_topics is None:
+                    bot.record_stat("redpacket_poll_errors")
+                else:
+                    bot.record_stat("redpacket_poll_success")
+                    sbsb_enabled = bot.is_source_enabled("sbsb")
+                    for topic in reversed(redpacket_topics):
+                        unique_id = f"sbsb:{topic['link']}"
+                        if unique_id in bot.seen_ids:
+                            continue
+
+                        bot.remember_seen_id(unique_id)
+                        bot.total_checked += 1
+                        bot.record_stat("total_scanned")
+
+                        if first_run or not sbsb_enabled:
+                            continue
+
+                        bot.record_stat("lottery_hits")
+                        if not bot.paused:
+                            deliver_public_match(
+                                bot,
+                                "烧饼论坛",
+                                "🍪",
+                                topic["category"],
+                                topic["title"],
+                                topic["author"],
+                                "论坛首页已标记为红包帖，正文可能仅登录用户可见。",
+                                topic["link"],
+                                "lottery",
+                                "命中烧饼论坛官方红包徽标",
+                            )
 
             bot.save_seen_ids()
             if first_run:

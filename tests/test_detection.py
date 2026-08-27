@@ -90,6 +90,33 @@ class DetectionRulesTest(unittest.TestCase):
         self.assertFalse(matched)
         self.assertEqual("trade_blocked", kind)
 
+    def test_sbsb_redpacket_badge_detects_non_keyword_title(self):
+        page_html = """
+        <ul class="post-list">
+          <li class="post-item">
+            <div class="post-title-row">
+              <a class="post-title" href="/t/2916/">普通主题</a>
+            </div>
+          </li>
+          <li class="post-item post-entry">
+            <div class="post-title-row">
+              <span class="topic-badge redpacket-badge">红包</span>
+              <a class="post-title" href="/t/2917/">吃饼了，饼友们！</a>
+            </div>
+            <div class="post-meta">
+              <span><a href="/u/1206/">mubdao</a></span>
+              <span class="post-forum-meta"><a href="/go/general/">综合</a></span>
+            </div>
+          </li>
+        </ul>
+        """
+        topics = main.parse_sbsb_redpacket_topics(page_html)
+        self.assertEqual(1, len(topics))
+        self.assertEqual("吃饼了，饼友们！", topics[0]["title"])
+        self.assertEqual("https://sb.sb/t/2917/", topics[0]["link"])
+        self.assertEqual("mubdao", topics[0]["author"])
+        self.assertEqual("综合", topics[0]["category"])
+
 
 class SeenIdPersistenceTest(unittest.TestCase):
     def test_seen_ids_keep_insertion_order_when_trimmed(self):

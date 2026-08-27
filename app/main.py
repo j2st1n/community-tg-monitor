@@ -12,7 +12,16 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
-APP_VERSION = "4.11"
+try:
+    from app.ai_classifier import (
+        AIClassificationError, OpenAICompatibleClassifier, clean_for_ai, normalize_chat_endpoint,
+    )
+except ModuleNotFoundError:
+    from ai_classifier import (
+        AIClassificationError, OpenAICompatibleClassifier, clean_for_ai, normalize_chat_endpoint,
+    )
+
+APP_VERSION = "5.0"
 APP_USER_AGENT = f"Community-Monitor-Bot/{APP_VERSION}"
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
@@ -21,10 +30,15 @@ SEEN_MSGS_FILE = os.path.join(DATA_DIR, "seen_msgs.json")
 CHECKIN_STATE_FILE = os.path.join(DATA_DIR, "checkin_state.json")
 DAILY_STATS_FILE = os.path.join(DATA_DIR, "daily_stats.json")
 SBSB_EVENTS_FILE = os.path.join(DATA_DIR, "sbsb_events.json")
+AI_SECRET_FILE = os.path.join(DATA_DIR, "ai_secret.json")
+NODESEEK_AI_STATE_FILE = os.path.join(DATA_DIR, "nodeseek_ai_state.json")
 MAX_SEEN_IDS = 10000
 MAX_SEEN_MSGS = 2000
 MAX_SBSB_EVENTS = 5000
 SBSB_RECONCILE_INTERVAL = 300
+MAX_NODESEEK_AI_PENDING = 500
+MAX_NODESEEK_AI_HISTORY = 2000
+MAX_AI_POSTS_PER_CYCLE = 5
 
 # 内置多源配置
 DEFAULT_SOURCES = [
@@ -57,6 +71,7 @@ BOT_COMMANDS = [
     {"command": "status", "description": "📊 监控状态与运行统计"},
     {"command": "report", "description": "📈 今日算法过滤与成功率日报"},
     {"command": "sources", "description": "📡 监控网站独立推送开关"},
+    {"command": "ai", "description": "🧠 NodeSeek AI 判定配置"},
     {"command": "signin", "description": "🍪 烧饼论坛一键签到与查分"},
     {"command": "keywords", "description": "🎯 查看并管理自定义关注词"},
     {"command": "blocks", "description": "🚫 查看并管理屏蔽词"},
@@ -145,6 +160,10 @@ class BotManager:
                 self.sources = list(DEFAULT_SOURCES)
         
         self.load_settings()
+        self.ai_api_key = self.load_ai_secret()
+        ai_state = self.load_nodeseek_ai_state()
+        self.nodeseek_ai_pending = ai_state.get("pending", {})
+        self.nodeseek_ai_history = ai_state.get("history", [])
         loaded_seen_ids = self.load_seen_ids()
         self.seen_id_order = list(dict.fromkeys(loaded_seen_ids))
         self.seen_ids = set(self.seen_id_order)
@@ -184,7 +203,13 @@ class BotManager:
             "marker_poll_success": 0,
             "marker_poll_errors": 0,
             "sbsb_lottery_events": 0,
-            "sbsb_redpacket_events": 0
+            "sbsb_redpacket_events": 0,
+            "ai_requests": 0,
+            "ai_errors": 0,
+            "ai_classified": 0,
+            "ai_giveaway_hits": 0,
+            "ai_second_reviews": 0,
+            "ai_uncertain": 0
         }
         if os.path.exists(DAILY_STATS_FILE):
             try:
@@ -223,7 +248,13 @@ class BotManager:
                     "marker_poll_success": 0,
                     "marker_poll_errors": 0,
                     "sbsb_lottery_events": 0,
-                    "sbsb_redpacket_events": 0
+                    "sbsb_redpacket_events": 0,
+                    "ai_requests": 0,
+                    "ai_errors": 0,
+                    "ai_classified": 0,
+                    "ai_giveaway_hits": 0,
+                    "ai_second_reviews": 0,
+                    "ai_uncertain": 0
                 }
             self.daily_stats[key] = self.daily_stats.get(key, 0) + count
             self.save_daily_stats()
@@ -258,6 +289,11 @@ class BotManager:
                     self.blockwords = data.get("blockwords", DEFAULT_BLOCKWORDS)
                     self.poll_interval = data.get("poll_interval", DEFAULT_POLL_INTERVAL)
                     self.paused = data.get("paused", False)
+                    self.ai_enabled = bool(data.get("ai_enabled", False))
+                    self.ai_endpoint = str(data.get("ai_endpoint", "")).strip()
+                    self.ai_model = str(data.get("ai_model", "")).strip()
+                    self.ai_judge_model = str(data.get("ai_judge_model", "")).strip()
+                    self.ai_accept_threshold = min(0.99, max(0.70, float(data.get("ai_accept_threshold", 0.90))))
                     saved_source_states = data.get("source_states", {})
                     for s in self.sources:
                         sid = s["id"]
@@ -271,6 +307,11 @@ class BotManager:
         self.blockwords = list(DEFAULT_BLOCKWORDS)
         self.poll_interval = DEFAULT_POLL_INTERVAL
         self.paused = False
+        self.ai_enabled = False
+        self.ai_endpoint = ""
+        self.ai_model = ""
+        self.ai_judge_model = ""
+        self.ai_accept_threshold = 0.90
         self.source_states = {s["id"]: True for s in self.sources}
         self.save_settings()
 
@@ -281,10 +322,148 @@ class BotManager:
             "blockwords": self.blockwords,
             "poll_interval": self.poll_interval,
             "paused": self.paused,
-            "source_states": self.source_states
+            "source_states": self.source_states,
+            "ai_enabled": self.ai_enabled,
+            "ai_endpoint": self.ai_endpoint,
+            "ai_model": self.ai_model,
+            "ai_judge_model": self.ai_judge_model,
+            "ai_accept_threshold": self.ai_accept_threshold
         }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load_ai_secret(self):
+        if os.path.exists(AI_SECRET_FILE):
+            try:
+                with open(AI_SECRET_FILE, "r", encoding="utf-8") as f:
+                    value = json.load(f).get("api_key", "")
+                    return str(value).strip()
+            except Exception as e:
+                print(f"[{datetime.now()}] 读取 AI 密钥文件异常: {e}", flush=True)
+        return ""
+
+    def save_ai_secret(self, api_key):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        temp_path = f"{AI_SECRET_FILE}.tmp"
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"api_key": api_key}, f, ensure_ascii=False)
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, AI_SECRET_FILE)
+        os.chmod(AI_SECRET_FILE, 0o600)
+        self.ai_api_key = api_key
+
+    def load_nodeseek_ai_state(self):
+        if os.path.exists(NODESEEK_AI_STATE_FILE):
+            try:
+                with open(NODESEEK_AI_STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                pending = data.get("pending", {})
+                history = data.get("history", [])
+                return {
+                    "pending": pending if isinstance(pending, dict) else {},
+                    "history": history if isinstance(history, list) else [],
+                }
+            except Exception as e:
+                print(f"[{datetime.now()}] 读取 NodeSeek AI 状态异常: {e}", flush=True)
+        return {"pending": {}, "history": []}
+
+    def save_nodeseek_ai_state(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if len(self.nodeseek_ai_pending) > MAX_NODESEEK_AI_PENDING:
+            overflow = len(self.nodeseek_ai_pending) - MAX_NODESEEK_AI_PENDING
+            for key in list(self.nodeseek_ai_pending)[:overflow]:
+                self.nodeseek_ai_pending.pop(key, None)
+        if len(self.nodeseek_ai_history) > MAX_NODESEEK_AI_HISTORY:
+            self.nodeseek_ai_history = self.nodeseek_ai_history[-MAX_NODESEEK_AI_HISTORY:]
+        with open(NODESEEK_AI_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {"pending": self.nodeseek_ai_pending, "history": self.nodeseek_ai_history},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+    def queue_nodeseek_post(self, unique_id, category, title, author, desc, link):
+        if unique_id in self.nodeseek_ai_pending:
+            return False
+        self.nodeseek_ai_pending[unique_id] = {
+            "id": unique_id,
+            "category": clean_for_ai(category, 80),
+            "title": clean_for_ai(title, 300),
+            "author": clean_for_ai(author, 100),
+            "description": clean_for_ai(desc, 4000),
+            "link": link,
+            "queued_at": int(time.time()),
+            "attempts": 0,
+            "next_retry_at": 0,
+            "last_error": "",
+        }
+        self.save_nodeseek_ai_state()
+        return True
+
+    def ai_is_ready(self):
+        return bool(self.ai_enabled and self.ai_endpoint and self.ai_model and self.ai_api_key)
+
+    def build_ai_classifier(self):
+        return OpenAICompatibleClassifier(
+            self.ai_endpoint,
+            self.ai_api_key,
+            self.ai_model,
+            self.ai_judge_model,
+        )
+
+    def masked_ai_key(self):
+        if not self.ai_api_key:
+            return "未设置"
+        if len(self.ai_api_key) <= 8:
+            return "••••••••"
+        return f"{self.ai_api_key[:3]}••••{self.ai_api_key[-4:]}"
+
+    def format_ai_card(self):
+        configured = bool(self.ai_endpoint and self.ai_model and self.ai_api_key)
+        running = self.ai_is_ready()
+        text = (
+            "🧠 <b>NodeSeek AI 抽奖判定</b>\n\n"
+            f"• 状态: {'🟢 运行中' if running else ('🟡 已配置但未启用' if configured else '⚪ 配置未完成')}\n"
+            f"• API: <code>{html.escape(self.ai_endpoint or '未设置')}</code>\n"
+            f"• 模型: <code>{html.escape(self.ai_model or '未设置')}</code>\n"
+            f"• 复审模型: <code>{html.escape(self.ai_judge_model or '跟随主模型')}</code>\n"
+            f"• API Key: <code>{html.escape(self.masked_ai_key())}</code>\n"
+            f"• 自动通过阈值: <code>{self.ai_accept_threshold:.2f}</code>\n"
+            f"• 待判定队列: <b>{len(self.nodeseek_ai_pending)}</b> 篇\n\n"
+            "<i>NodeSeek 不使用关键词预筛。每篇新帖先做结构化事实抽取，边界案例再独立复审。</i>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔌 设置 API", "callback_data": "ai:set_endpoint"},
+                    {"text": "🔑 设置 Key", "callback_data": "ai:set_key"},
+                ],
+                [
+                    {"text": "🤖 设置模型", "callback_data": "ai:set_model"},
+                    {"text": "⚖️ 复审模型", "callback_data": "ai:set_judge"},
+                ],
+                [{"text": "🎚️ 设置阈值", "callback_data": "ai:set_threshold"}],
+                [
+                    {"text": "🧪 测试连接", "callback_data": "ai:test"},
+                    {"text": "⏯️ 启用/停用", "callback_data": "ai:toggle"},
+                ],
+            ]
+        }
+        return text, markup
+
+    def test_ai_connection(self):
+        classifier = self.build_ai_classifier()
+        facts = classifier.extract_facts({
+            "source": "NodeSeek",
+            "category": "daily",
+            "title": "【抽奖】回复本帖随机送一台测试 VPS",
+            "author": "system-test",
+            "description": "活动今天有效，坛友回复即可参加，免费随机抽取一人。",
+            "link": "https://www.nodeseek.com/",
+        })
+        return facts
 
     def is_source_enabled(self, source_id):
         with self.lock:
@@ -643,6 +822,12 @@ class BotManager:
         marker_poll_errors = stats.get("marker_poll_errors", 0)
         sbsb_lottery_events = stats.get("sbsb_lottery_events", 0)
         sbsb_redpacket_events = stats.get("sbsb_redpacket_events", 0)
+        ai_requests = stats.get("ai_requests", 0)
+        ai_errors = stats.get("ai_errors", 0)
+        ai_classified = stats.get("ai_classified", 0)
+        ai_giveaway_hits = stats.get("ai_giveaway_hits", 0)
+        ai_second_reviews = stats.get("ai_second_reviews", 0)
+        ai_uncertain = stats.get("ai_uncertain", 0)
 
         total_polls = poll_success + poll_errors
         success_rate = (poll_success / total_polls * 100) if total_polls > 0 else 100.0
@@ -663,6 +848,8 @@ class BotManager:
             f"• 📊 <b>全网新发主题</b>: <b>{scanned}</b> 篇\n"
             f"• 📡 <b>RSS 来源请求</b>: <b>{poll_success}</b> 次 (每30s扫描双源)\n"
             f"• 🎁 <b>抽奖规则命中</b>: <b>{lottery_hits}</b> 篇\n"
+            f"• 🧠 <b>NodeSeek AI 判定</b>: {ai_classified} 篇 / 命中 {ai_giveaway_hits} / 二审 {ai_second_reviews} / 待审 {ai_uncertain}\n"
+            f"• 🔌 <b>AI API 请求</b>: {ai_requests} 次 / 异常 {ai_errors}\n"
             f"• 🏷️ <b>自定义词命中</b>: <b>{custom_hits}</b> 篇\n"
             f"• ✉️ <b>Telegram 送达</b>: <b>{delivery_success}</b> 成功 / <b>{delivery_errors}</b> 失败\n"
             f"• 🛡️ <b>噪音负向拦截</b>: <b>{total_blocked}</b> 篇 (交易 {trade_blocked} / 噪音 {noise_blocked})\n"
@@ -826,6 +1013,69 @@ def handle_callback_query(bot, query):
         text, markup = bot.format_sources_card()
         bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
 
+    elif data == "ai:set_endpoint":
+        bot.user_states[chat_id] = "waiting_for_ai_endpoint"
+        bot.answer_callback_query(query_id, "请发送 API 地址")
+        bot.send_msg(
+            chat_id,
+            "🔌 <b>请输入 OpenAI-compatible API 地址</b>\n"
+            "例如：<code>https://api.example.com/v1</code>\n"
+            "也可以直接填写完整的 <code>/chat/completions</code> 地址。",
+        )
+
+    elif data == "ai:set_key":
+        bot.user_states[chat_id] = "waiting_for_ai_key"
+        bot.answer_callback_query(query_id, "请发送 API Key")
+        bot.send_msg(chat_id, "🔑 <b>请输入 API Key</b>\n<i>密钥将单独保存且不会在消息或日志中完整显示。</i>")
+
+    elif data == "ai:set_model":
+        bot.user_states[chat_id] = "waiting_for_ai_model"
+        bot.answer_callback_query(query_id, "请发送模型名")
+        bot.send_msg(chat_id, "🤖 <b>请输入主模型名称</b>\n例如：<code>gpt-4.1-mini</code>")
+
+    elif data == "ai:set_judge":
+        bot.user_states[chat_id] = "waiting_for_ai_judge"
+        bot.answer_callback_query(query_id, "请发送复审模型名")
+        bot.send_msg(chat_id, "⚖️ <b>请输入复审模型名称</b>\n发送 <code>-</code> 可改为跟随主模型。")
+
+    elif data == "ai:set_threshold":
+        bot.user_states[chat_id] = "waiting_for_ai_threshold"
+        bot.answer_callback_query(query_id, "请发送阈值")
+        bot.send_msg(chat_id, "🎚️ <b>请输入自动通过阈值</b>\n允许范围 <code>0.70～0.99</code>，建议 <code>0.90</code>。")
+
+    elif data == "ai:toggle":
+        if not (bot.ai_endpoint and bot.ai_model and bot.ai_api_key):
+            bot.answer_callback_query(query_id, "请先完成 API、Key 和模型配置")
+            bot.send_msg(chat_id, "⚠️ <b>AI 配置尚未完成，无法启用。</b>")
+        else:
+            bot.ai_enabled = not bot.ai_enabled
+            if bot.ai_enabled:
+                for record in bot.nodeseek_ai_pending.values():
+                    record["next_retry_at"] = 0
+            bot.save_settings()
+            bot.save_nodeseek_ai_state()
+            bot.answer_callback_query(query_id, "AI 已启用" if bot.ai_enabled else "AI 已停用")
+            text_card, markup = bot.format_ai_card()
+            bot.edit_msg_text(chat_id, msg_id, text_card, reply_markup=markup)
+
+    elif data == "ai:test":
+        if not (bot.ai_endpoint and bot.ai_model and bot.ai_api_key):
+            bot.answer_callback_query(query_id, "请先完成配置")
+            bot.send_msg(chat_id, "⚠️ <b>请先设置 API 地址、API Key 和主模型。</b>")
+        else:
+            bot.answer_callback_query(query_id, "正在测试连接")
+            bot.send_msg(chat_id, "⏳ <b>正在调用模型进行结构化判定测试...</b>")
+            try:
+                facts = bot.test_ai_connection()
+                bot.send_msg(
+                    chat_id,
+                    "✅ <b>AI 连接和 JSON 输出验证成功</b>\n"
+                    f"模型识别状态：<code>{facts['event_state']}</code>\n"
+                    f"置信度：<code>{facts['confidence']:.2f}</code>",
+                )
+            except (AIClassificationError, ValueError) as exc:
+                bot.send_msg(chat_id, f"❌ <b>AI 测试失败</b>\n<code>{html.escape(str(exc))}</code>")
+
     elif data == "menu:add_kw":
         bot.user_states[chat_id] = "waiting_for_add"
         bot.answer_callback_query(query_id, "请直接输入新关键词")
@@ -907,6 +1157,71 @@ def handle_command_or_text(bot, chat_id, text):
 
     if chat_id in bot.user_states and not text.startswith("/"):
         state = bot.user_states.pop(chat_id)
+        if state == "waiting_for_ai_endpoint":
+            try:
+                normalize_chat_endpoint(text)
+                bot.ai_endpoint = text.strip().rstrip("/")
+                bot.save_settings()
+                for record in bot.nodeseek_ai_pending.values():
+                    record["next_retry_at"] = 0
+                bot.save_nodeseek_ai_state()
+                msg_text, markup = bot.format_ai_card()
+                bot.send_msg(chat_id, f"✅ <b>API 地址已保存</b>\n\n{msg_text}", reply_markup=markup)
+            except ValueError as exc:
+                bot.send_msg(chat_id, f"❌ <b>API 地址无效</b>\n<code>{html.escape(str(exc))}</code>")
+            return
+
+        if state == "waiting_for_ai_key":
+            api_key = text.strip()
+            if not api_key or len(api_key) > 1000:
+                bot.send_msg(chat_id, "❌ <b>API Key 不能为空或过长。</b>")
+            else:
+                bot.save_ai_secret(api_key)
+                for record in bot.nodeseek_ai_pending.values():
+                    record["next_retry_at"] = 0
+                bot.save_nodeseek_ai_state()
+                msg_text, markup = bot.format_ai_card()
+                bot.send_msg(chat_id, f"✅ <b>API Key 已安全保存</b>\n\n{msg_text}", reply_markup=markup)
+            return
+
+        if state == "waiting_for_ai_model":
+            model = text.strip()
+            if not model or len(model) > 200 or any(ch.isspace() for ch in model):
+                bot.send_msg(chat_id, "❌ <b>模型名无效，模型名不能包含空格。</b>")
+            else:
+                bot.ai_model = model
+                bot.save_settings()
+                for record in bot.nodeseek_ai_pending.values():
+                    record["next_retry_at"] = 0
+                bot.save_nodeseek_ai_state()
+                msg_text, markup = bot.format_ai_card()
+                bot.send_msg(chat_id, f"✅ <b>主模型已保存</b>\n\n{msg_text}", reply_markup=markup)
+            return
+
+        if state == "waiting_for_ai_judge":
+            model = "" if text.strip() == "-" else text.strip()
+            if len(model) > 200 or any(ch.isspace() for ch in model):
+                bot.send_msg(chat_id, "❌ <b>复审模型名无效，模型名不能包含空格。</b>")
+            else:
+                bot.ai_judge_model = model
+                bot.save_settings()
+                msg_text, markup = bot.format_ai_card()
+                bot.send_msg(chat_id, f"✅ <b>复审模型已保存</b>\n\n{msg_text}", reply_markup=markup)
+            return
+
+        if state == "waiting_for_ai_threshold":
+            try:
+                threshold = float(text.strip())
+                if not 0.70 <= threshold <= 0.99:
+                    raise ValueError
+                bot.ai_accept_threshold = threshold
+                bot.save_settings()
+                msg_text, markup = bot.format_ai_card()
+                bot.send_msg(chat_id, f"✅ <b>自动通过阈值已设为 {threshold:.2f}</b>\n\n{msg_text}", reply_markup=markup)
+            except ValueError:
+                bot.send_msg(chat_id, "❌ <b>阈值无效，请输入 0.70 到 0.99 之间的数字。</b>")
+            return
+
         if state == "waiting_for_add":
             new_kws = [k for k in text.split() if k not in LEGACY_BUILTIN_WORDS]
             added = []
@@ -958,6 +1273,7 @@ def handle_command_or_text(bot, chat_id, text):
                 "├ /status - 监控运行统计与健康报告\n"
                 "├ /report - 📈 <b>今日算法过滤与成功率日报</b>\n"
                 "├ /sources - 📡 <b>各网站推送独立开关管理</b>\n"
+                "├ /ai - 🧠 <b>NodeSeek AI 地址、密钥与模型配置</b>\n"
                 "├ /signin - 🍪 <b>烧饼论坛一键签到与查分</b>\n"
                 "├ /keywords - 🎯 <b>查看并管理自定义关注词</b>\n"
                 "└ /blocks - 🚫 <b>查看并交互式管理屏蔽词</b>\n\n"
@@ -976,6 +1292,11 @@ def handle_command_or_text(bot, chat_id, text):
 
         elif cmd in ["/sources", "/sites"]:
             text_card, markup = bot.format_sources_card()
+            res = bot.send_msg(chat_id, text_card, reply_markup=markup)
+            print(f"[{datetime.now()}] ✅ 指令 {cmd} 发送结果: {res}", flush=True)
+
+        elif cmd == "/ai":
+            text_card, markup = bot.format_ai_card()
             res = bot.send_msg(chat_id, text_card, reply_markup=markup)
             print(f"[{datetime.now()}] ✅ 指令 {cmd} 发送结果: {res}", flush=True)
 
@@ -1011,6 +1332,7 @@ def handle_command_or_text(bot, chat_id, text):
             sources_text = "\n".join(sources_list)
 
             sbsb_private_status = "🟢 实时运行中（含每日 08:05 自动签到与通知）" if bot.sbsb_cookie else "⚪ 未配置 SBSB_COOKIE"
+            ai_status = "🟢 运行中" if bot.ai_is_ready() else ("🟡 已停用" if bot.ai_endpoint and bot.ai_model and bot.ai_api_key else "⚪ 未配置")
             status_text = (
                 "📊 <b>社区监控守护状态报告</b>\n\n"
                 f"⏱️ <b>运行时间</b>: {hours}小时 {minutes}分 {seconds}秒\n"
@@ -1018,6 +1340,7 @@ def handle_command_or_text(bot, chat_id, text):
                 f"📡 <b>轮询周期</b>: 每 {bot.poll_interval} 秒\n"
                 f"🌐 <b>监控网站状态 ({len(bot.sources)})</b>:\n{sources_text}\n"
                 f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_status}\n"
+                f"🧠 <b>NodeSeek AI</b>: {ai_status}（待判定 {len(bot.nodeseek_ai_pending)} 篇）\n"
                 f"🎯 <b>自定义关注词数</b>: {len(bot.keywords)} 个\n"
                 f"🚫 <b>屏蔽词数</b>: {len(bot.blockwords)} 个\n"
                 f"📈 <b>已扫描去重库</b>: {len(bot.seen_ids)} 篇公开帖 / {len(bot.seen_msgs)} 条私信与通知\n"
@@ -1275,6 +1598,98 @@ def deliver_public_match(bot, source_name, source_icon, category, title, author,
     if not delivered:
         print(f"[{datetime.now()}] ❌ Telegram 推送失败: [{source_name}] {title}", flush=True)
     return delivered
+
+
+def process_nodeseek_ai_queue(bot):
+    """Classify queued NodeSeek posts; API failures remain pending for retry."""
+    if not bot.ai_is_ready() or not bot.is_source_enabled("nodeseek"):
+        return
+    try:
+        classifier = bot.build_ai_classifier()
+    except ValueError as exc:
+        print(f"[{datetime.now()}] ⚠️ NodeSeek AI 配置无效: {exc}", flush=True)
+        return
+
+    processed = 0
+    now_ts = int(time.time())
+    for unique_id, record in list(bot.nodeseek_ai_pending.items()):
+        if processed >= MAX_AI_POSTS_PER_CYCLE:
+            break
+        if int(record.get("next_retry_at", 0)) > now_ts:
+            continue
+        processed += 1
+        post = {
+            "source": "NodeSeek",
+            "category": record.get("category", "综合"),
+            "title": record.get("title", ""),
+            "author": record.get("author", "未知"),
+            "description": record.get("description", ""),
+            "link": record.get("link", ""),
+        }
+        bot.record_stat("ai_requests")
+        try:
+            result = classifier.classify(post, accept_threshold=bot.ai_accept_threshold)
+        except (AIClassificationError, ValueError) as exc:
+            attempts = int(record.get("attempts", 0)) + 1
+            retry_seconds = min(1800, 60 * (2 ** min(attempts - 1, 5)))
+            record["attempts"] = attempts
+            record["next_retry_at"] = now_ts + retry_seconds
+            record["last_error"] = clean_for_ai(str(exc), 180)
+            bot.record_stat("ai_errors")
+            bot.save_nodeseek_ai_state()
+            print(
+                f"[{datetime.now()}] ⚠️ NodeSeek AI 判定失败，{retry_seconds}s 后重试: "
+                f"{record.get('title', '')} ({record['last_error']})",
+                flush=True,
+            )
+            continue
+
+        bot.record_stat("ai_classified")
+        if result.get("reviewed"):
+            bot.record_stat("ai_second_reviews")
+        decision = result.get("decision")
+        if decision == "giveaway":
+            bot.record_stat("ai_giveaway_hits")
+            bot.record_stat("lottery_hits")
+            evidence = "；".join(result.get("evidence", [])[:2])
+            reason = result.get("reason", "AI 语义判定为有效抽奖")
+            if evidence:
+                reason = f"{reason}；证据：{evidence}"
+            if not bot.paused:
+                deliver_public_match(
+                    bot,
+                    "NodeSeek",
+                    "🌐",
+                    record.get("category", "综合"),
+                    record.get("title", ""),
+                    record.get("author", "未知"),
+                    record.get("description", ""),
+                    record.get("link", ""),
+                    "lottery",
+                    f"AI 双阶段语义判定（置信度 {result.get('confidence', 0):.2f}）：{reason}",
+                )
+        elif decision == "uncertain":
+            bot.record_stat("ai_uncertain")
+
+        bot.nodeseek_ai_history.append({
+            "id": unique_id,
+            "title": record.get("title", ""),
+            "link": record.get("link", ""),
+            "decision": decision,
+            "confidence": result.get("confidence", 0),
+            "reason": result.get("reason", ""),
+            "reviewed": bool(result.get("reviewed")),
+            "classified_at": int(time.time()),
+        })
+        bot.nodeseek_ai_pending.pop(unique_id, None)
+        bot.remember_seen_id(unique_id)
+        bot.save_nodeseek_ai_state()
+        bot.save_seen_ids()
+        print(
+            f"[{datetime.now()}] 🧠 [NodeSeek AI] {decision} "
+            f"({result.get('confidence', 0):.2f}): {record.get('title', '')}",
+            flush=True,
+        )
 
 def sbsb_checkin_scheduler_thread(bot):
     """烧饼论坛每日自动签到调度线程 (北京时间每天 08:05 执行)"""
@@ -1575,6 +1990,23 @@ def rss_monitor_thread(bot):
                     if not unique_id or unique_id in bot.seen_ids:
                         continue
 
+                    if source_id == "nodeseek":
+                        if unique_id in bot.nodeseek_ai_pending:
+                            if not is_enabled:
+                                bot.nodeseek_ai_pending.pop(unique_id, None)
+                                bot.remember_seen_id(unique_id)
+                                bot.save_nodeseek_ai_state()
+                            continue
+
+                        bot.total_checked += 1
+                        bot.record_stat("total_scanned")
+                        if first_run or not is_enabled:
+                            bot.remember_seen_id(unique_id)
+                            continue
+
+                        bot.queue_nodeseek_post(unique_id, cat, title, author, desc, link)
+                        continue
+
                     bot.remember_seen_id(unique_id)
                     bot.total_checked += 1
                     bot.record_stat("total_scanned")
@@ -1582,15 +2014,18 @@ def rss_monitor_thread(bot):
                     if first_run or not is_enabled:
                         continue
 
-                    # 烧饼自动抽奖检测只认官方标记；RSS 仍可承载用户自定义关注词。
+                    # 烧饼自动抽奖检测只认官方标记；RSS 只承载用户自定义关注词。
                     is_hit, hit_type, hit_reason = bot.evaluate_post(
-                        source_name, cat, title, desc, custom_only=(source_id == "sbsb")
+                        source_name, cat, title, desc, custom_only=True
                     )
                     if not bot.paused and is_hit:
                         deliver_public_match(
                             bot, source_name, source_icon, cat, title, author,
                             desc, link, hit_type, hit_reason,
                         )
+
+            # NodeSeek 不使用关键词或板块门槛；所有新帖进入 AI 事实抽取与裁决队列。
+            process_nodeseek_ai_queue(bot)
 
             # RSS 与徽标视图可能存在可见性时差，使用独立事件账本检测官方抽奖/红包标记。
             if any(source["id"] == "sbsb" for source in bot.sources):

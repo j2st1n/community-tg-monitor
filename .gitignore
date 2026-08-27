@@ -1,6 +1,5 @@
 .env
-data/settings.json
-data/seen_ids.json
+data/*.json
 *.log
 __pycache__/
 .DS_Store

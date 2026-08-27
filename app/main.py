@@ -11,12 +11,16 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
+APP_VERSION = "4.9"
+APP_USER_AGENT = f"Community-Monitor-Bot/{APP_VERSION}"
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 SEEN_IDS_FILE = os.path.join(DATA_DIR, "seen_ids.json")
 SEEN_MSGS_FILE = os.path.join(DATA_DIR, "seen_msgs.json")
 CHECKIN_STATE_FILE = os.path.join(DATA_DIR, "checkin_state.json")
 DAILY_STATS_FILE = os.path.join(DATA_DIR, "daily_stats.json")
+MAX_SEEN_IDS = 10000
+MAX_SEEN_MSGS = 2000
 
 # 内置多源配置
 DEFAULT_SOURCES = [
@@ -64,9 +68,36 @@ LEGACY_BUILTIN_WORDS = {
     "口令", "红包", "开奖", "盖楼", "中奖", "白嫖", "免费"
 }
 
+BROAD_TRADE_BLOCKWORDS = {"收", "求", "买", "询", "出"}
+TRADE_PREFIX_PATTERNS = {
+    "收": r"^收(?:购|个|一|两|几|台|只|求|机器|小鸡|鸡|号|码|\s|[A-Za-z0-9])",
+    "求": r"^求(?:购|收|个|一|两|几|台|只|机器|小鸡|鸡|号|码|\s|[A-Za-z0-9])",
+    "买": r"^买(?:入|个|一|两|几|台|只|机器|小鸡|鸡|号|码|\s|[A-Za-z0-9])",
+    "询": r"^询(?:价|问购买|问收购)",
+    "出": r"^出(?:售|手|掉|个|一|两|几|台|只|机器|小鸡|鸡|号|码|\s|[A-Za-z0-9])",
+}
+
 def clean_title_prefix(title):
     """去除标题开头的括号和特殊标点符号，如 '【出】' -> '出】'"""
     return re.sub(r'^[【\[\(（〖\s]+', '', title)
+
+
+def matches_blockword(title, blockword):
+    """匹配用户屏蔽词；对单字交易词使用语义边界，避免“收藏/求助/出炉”等误判。"""
+    if not blockword:
+        return False
+
+    stripped = title.strip()
+    clean_t = clean_title_prefix(stripped)
+    if blockword not in BROAD_TRADE_BLOCKWORDS:
+        return clean_t.startswith(blockword) or stripped.startswith(blockword)
+
+    bracketed = re.match(
+        rf'^[【\[\(（〖]\s*{re.escape(blockword)}(?:\s|[】\]\)）〗])',
+        stripped,
+        re.IGNORECASE,
+    )
+    return bool(bracketed or re.match(TRADE_PREFIX_PATTERNS[blockword], stripped, re.IGNORECASE))
 
 class BotManager:
     def __init__(self):
@@ -110,8 +141,12 @@ class BotManager:
                 self.sources = list(DEFAULT_SOURCES)
         
         self.load_settings()
-        self.seen_ids = self.load_seen_ids()
-        self.seen_msgs = self.load_seen_msgs()
+        loaded_seen_ids = self.load_seen_ids()
+        self.seen_id_order = list(dict.fromkeys(loaded_seen_ids))
+        self.seen_ids = set(self.seen_id_order)
+        loaded_seen_msgs = self.load_seen_msgs()
+        self.seen_msg_order = list(dict.fromkeys(loaded_seen_msgs))
+        self.seen_msgs = set(self.seen_msg_order)
         self.register_telegram_commands()
 
     def get_today_cst(self):
@@ -129,7 +164,9 @@ class BotManager:
             "noise_blocked": 0,
             "private_notified": 0,
             "poll_success": 0,
-            "poll_errors": 0
+            "poll_errors": 0,
+            "delivery_success": 0,
+            "delivery_errors": 0
         }
         if os.path.exists(DAILY_STATS_FILE):
             try:
@@ -162,7 +199,9 @@ class BotManager:
                     "noise_blocked": 0,
                     "private_notified": 0,
                     "poll_success": 0,
-                    "poll_errors": 0
+                    "poll_errors": 0,
+                    "delivery_success": 0,
+                    "delivery_errors": 0
                 }
             self.daily_stats[key] = self.daily_stats.get(key, 0) + count
             self.save_daily_stats()
@@ -174,7 +213,7 @@ class BotManager:
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.8"}
+            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -240,29 +279,49 @@ class BotManager:
         if os.path.exists(SEEN_IDS_FILE):
             try:
                 with open(SEEN_IDS_FILE, "r", encoding="utf-8") as f:
-                    return set(json.load(f))
+                    data = json.load(f)
+                    return data if isinstance(data, list) else []
             except Exception:
-                return set()
-        return set()
+                return []
+        return []
+
+    def remember_seen_id(self, unique_id):
+        if unique_id in self.seen_ids:
+            return False
+        self.seen_ids.add(unique_id)
+        self.seen_id_order.append(unique_id)
+        return True
 
     def save_seen_ids(self):
-        id_list = list(self.seen_ids)[-1000:]
+        if len(self.seen_id_order) > MAX_SEEN_IDS:
+            self.seen_id_order = self.seen_id_order[-MAX_SEEN_IDS:]
+            self.seen_ids = set(self.seen_id_order)
         with open(SEEN_IDS_FILE, "w", encoding="utf-8") as f:
-            json.dump(id_list, f, ensure_ascii=False)
+            json.dump(self.seen_id_order, f, ensure_ascii=False)
 
     def load_seen_msgs(self):
         if os.path.exists(SEEN_MSGS_FILE):
             try:
                 with open(SEEN_MSGS_FILE, "r", encoding="utf-8") as f:
-                    return set(json.load(f))
+                    data = json.load(f)
+                    return data if isinstance(data, list) else []
             except Exception:
-                return set()
-        return set()
+                return []
+        return []
+
+    def remember_seen_msg(self, unique_id):
+        if unique_id in self.seen_msgs:
+            return False
+        self.seen_msgs.add(unique_id)
+        self.seen_msg_order.append(unique_id)
+        return True
 
     def save_seen_msgs(self):
-        id_list = list(self.seen_msgs)[-500:]
+        if len(self.seen_msg_order) > MAX_SEEN_MSGS:
+            self.seen_msg_order = self.seen_msg_order[-MAX_SEEN_MSGS:]
+            self.seen_msgs = set(self.seen_msg_order)
         with open(SEEN_MSGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(id_list, f, ensure_ascii=False)
+            json.dump(self.seen_msg_order, f, ensure_ascii=False)
 
     def send_msg(self, chat_id, text, reply_markup=None, disable_preview=True, retries=2):
         api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
@@ -279,7 +338,7 @@ class BotManager:
             req = urllib.request.Request(
                 api_url,
                 data=data,
-                headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.8"}
+                headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT}
             )
             try:
                 with urllib.request.urlopen(req, timeout=12) as resp:
@@ -310,7 +369,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.8"}
+            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT}
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -326,7 +385,7 @@ class BotManager:
         req = urllib.request.Request(
             api_url,
             data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "Community-Monitor-Bot/4.8"}
+            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT}
         )
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -349,7 +408,7 @@ class BotManager:
 
             # 1. 第一层：硬性买卖求购过滤
             for bw in self.blockwords:
-                if bw and (clean_t.startswith(bw) or title.startswith(bw)):
+                if matches_blockword(title, bw):
                     self.record_stat("trade_blocked")
                     print(f"[{datetime.now()}] 🚫 [买卖拦截] [{source_name}] {title} (前缀: {bw})", flush=True)
                     return False, "trade_blocked", f"命中买卖前缀 [{bw}]"
@@ -359,11 +418,18 @@ class BotManager:
                 print(f"[{datetime.now()}] 🚫 [买卖拦截] [{source_name}] {title} (交易词汇)", flush=True)
                 return False, "trade_blocked", "命中交易词汇"
 
-            # 2. 第二层：非抽奖意图词过滤（商业新闻/抽卡/比喻/求助）
+            # 2. 用户自定义关注词高于通用噪音规则，但仍服从用户屏蔽词。
+            for c_kw in self.keywords:
+                if c_kw and (c_kw in title or c_kw in desc):
+                    self.record_stat("custom_hits")
+                    return True, "custom", f"命中自定义词 [{c_kw}]"
+
+            # 3. 非抽奖意图词过滤（商业新闻/抽卡/路由术语/求助）
             anti_intent_words = [
                 '抽成', '抽水', '抽烟', '抽风', '抽空', '抽卡', '抽签', '抽检', '抽屉', '抽走',
                 '如抽奖', '像抽奖', '当抽奖', '中奖了', '中过奖', '怎么填写', '怎么填', '如何填',
-                '如何获得', '如何免费', '怎样免费', '推荐入坑', '的选择', '有套路吗', '清退', '谈判'
+                '如何获得', '如何免费', '怎样免费', '推荐入坑', '的选择', '有套路吗', '清退', '谈判',
+                '送中IP', '送中鸡', '送中线路', '送美鸡', '送修', '送达', '送检', '送审'
             ]
             for w in anti_intent_words:
                 if w in title:
@@ -371,14 +437,14 @@ class BotManager:
                     print(f"[{datetime.now()}] 🚫 [噪音拦截] [{source_name}] {title} (意图干扰: {w})", flush=True)
                     return False, "noise_blocked", f"命中干扰意图 [{w}]"
 
-            # 3. 疑问句拦截
+            # 4. 疑问句拦截
             if re.search(r'(吗|么|呢|？|\?)$', title.strip()) and not re.search(r'[【\[〖]抽奖[】\]〗]', title):
                 if any(qw in title for qw in ['怎么', '如何', '还能', '有没有', '谁有', '什么好', '哪个好', '推荐']):
                     self.record_stat("noise_blocked")
                     print(f"[{datetime.now()}] 🚫 [噪音拦截] [{source_name}] {title} (疑问咨询句式)", flush=True)
                     return False, "noise_blocked", "命中疑问咨询句式"
 
-            # 4. 第三层：黄金强特征（全口径覆盖：抽/送/roll/红包/福利）
+            # 5. 黄金强特征（限定赠送对象，避免把“送中/送修”等普通词误判为赠送）
             gold_patterns = [
                 r'^[【\[〖\s]*抽奖',
                 r'[【\[〖]抽奖[】\]〗]',
@@ -387,7 +453,8 @@ class BotManager:
                 r'抽\s*(?:\d+|[一两三四五六七八九十]|台|个|只|位|份|张|条|组|点|些|波|\$|刀|元|u|U|烧饼)',
                 r'抽(?:一台|一个|只小鸡|台小鸡|机器|激活码|兑换码|体验金|年付|月付|烧饼|域名)',
                 r'抽(?:选|出|送)\s*(?:\d+|[一两三四五六七八九十])',
-                r'^[【\[\(（〖\s]*(?:送|免费送|白送|直接送|送只|送个|送台|送一|送点|送波|发红包|开红包)',
+                r'^[【\[\(（〖\s]*(?:免费送|白送|直接送|赠送|送(?:只|个|台|一|点|波|份|张|码|饼|机器|小鸡|鸡|VPS|vps|账号|会员|流量|余额)|发红包|开红包)',
+                r'^[【\[〖\s]*福利[】\]〗\s:：-]*(?:抽|送|赠|红包)',
                 r'给大家送点',
                 r'红包(?:帖|第[一二三四五六七八九十\d]+弹)',
                 r'玩(?:一玩)?红包',
@@ -407,12 +474,6 @@ class BotManager:
             if '抽奖' in title and any(k in title for k in ['开奖', '送', '第一期', '第二期', '第三期', '见者有份', '福利', '奖品', '吧', '活动']):
                 self.record_stat("lottery_hits")
                 return True, "lottery", "命中抽奖组合特征"
-
-            # 5. 用户自定义专属关注词
-            for c_kw in self.keywords:
-                if c_kw and (c_kw in title or c_kw in desc):
-                    self.record_stat("custom_hits")
-                    return True, "custom", f"命中自定义词 [{c_kw}]"
 
             # 6. 正文强抽奖规则检测
             desc_clean = desc.replace('送中', '').replace('没送中', '').replace('未送中', '')
@@ -520,6 +581,8 @@ class BotManager:
         priv_notified = stats.get("private_notified", 0)
         poll_success = stats.get("poll_success", 0)
         poll_errors = stats.get("poll_errors", 0)
+        delivery_success = stats.get("delivery_success", 0)
+        delivery_errors = stats.get("delivery_errors", 0)
 
         total_polls = poll_success + poll_errors
         success_rate = (poll_success / total_polls * 100) if total_polls > 0 else 100.0
@@ -538,9 +601,10 @@ class BotManager:
             f"📅 <b>统计日期</b>: <code>{date_str}</code> (周期: 24h)\n\n"
             "🔍 <b>公开帖子扫描与过滤分析</b>\n"
             f"• 📊 <b>全网新发主题</b>: <b>{scanned}</b> 篇\n"
-            f"• 📡 <b>高频轮询巡检</b>: <b>{poll_success}</b> 轮次 (每30s双源扫描)\n"
-            f"• 🎁 <b>精准抽奖命中</b>: <b>{lottery_hits}</b> 篇 (100% 决策树交付)\n"
+            f"• 📡 <b>RSS 来源请求</b>: <b>{poll_success}</b> 次 (每30s扫描双源)\n"
+            f"• 🎁 <b>抽奖规则命中</b>: <b>{lottery_hits}</b> 篇\n"
             f"• 🏷️ <b>自定义词命中</b>: <b>{custom_hits}</b> 篇\n"
+            f"• ✉️ <b>Telegram 送达</b>: <b>{delivery_success}</b> 成功 / <b>{delivery_errors}</b> 失败\n"
             f"• 🛡️ <b>噪音负向拦截</b>: <b>{total_blocked}</b> 篇 (交易 {trade_blocked} / 噪音 {noise_blocked})\n"
             f"• 📬 <b>私信与互动通知</b>: <b>{priv_notified}</b> 次\n\n"
             "🌐 <b>各站点推送开关</b>\n"
@@ -990,7 +1054,7 @@ def telegram_polling_thread(bot):
     while True:
         try:
             url = f"https://api.telegram.org/bot{bot.bot_token}/getUpdates?offset={offset}&timeout=20"
-            req = urllib.request.Request(url, headers={"User-Agent": "Community-Monitor-Bot/4.8"})
+            req = urllib.request.Request(url, headers={"User-Agent": APP_USER_AGENT})
             with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("ok"):
@@ -1023,7 +1087,7 @@ def telegram_polling_thread(bot):
 def fetch_rss(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/4.8)"}
+        headers={"User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (CommunityFeed/{APP_VERSION})"}
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -1215,11 +1279,10 @@ def sbsb_private_messages_thread(bot):
                 unique_key = f"notif:{iso_time}_{user}_{kind}"
 
                 if first_run:
-                    bot.seen_msgs.add(unique_key)
+                    bot.remember_seen_msg(unique_key)
                     continue
 
-                if unique_key not in bot.seen_msgs:
-                    bot.seen_msgs.add(unique_key)
+                if bot.remember_seen_msg(unique_key):
                     bot.total_private_notified += 1
                     bot.record_stat("private_notified")
                     print(f"[{datetime.now()}] 📬 命中烧饼论坛新互动通知: [{kind}] {user} - {content}", flush=True)
@@ -1252,11 +1315,10 @@ def sbsb_private_messages_thread(bot):
                 for thread_id in unique_threads:
                     thread_key = f"thread:{thread_id}"
                     if first_run:
-                        bot.seen_msgs.add(thread_key)
+                        bot.remember_seen_msg(thread_key)
                         continue
 
-                    if thread_key not in bot.seen_msgs:
-                        bot.seen_msgs.add(thread_key)
+                    if bot.remember_seen_msg(thread_key):
                         bot.total_private_notified += 1
                         bot.record_stat("private_notified")
                         print(f"[{datetime.now()}] 📬 发现烧饼论坛新私信对话: {thread_id}", flush=True)
@@ -1332,7 +1394,7 @@ def rss_monitor_thread(bot):
                     if not unique_id or unique_id in bot.seen_ids:
                         continue
 
-                    bot.seen_ids.add(unique_id)
+                    bot.remember_seen_id(unique_id)
                     bot.total_checked += 1
                     bot.record_stat("total_scanned")
 
@@ -1354,7 +1416,10 @@ def rss_monitor_thread(bot):
                             f"📝 <b>摘要</b>: {summary}\n\n"
                             f"🔗 <b>链接</b>: {link}"
                         )
-                        bot.send_msg(bot.admin_chat_id, msg, disable_preview=False)
+                        delivered = bot.send_msg(bot.admin_chat_id, msg, disable_preview=False)
+                        bot.record_stat("delivery_success" if delivered else "delivery_errors")
+                        if not delivered:
+                            print(f"[{datetime.now()}] ❌ Telegram 推送失败: [{source_name}] {title}", flush=True)
 
             bot.save_seen_ids()
             if first_run:
@@ -1372,7 +1437,7 @@ def main():
         print("❌ 错误: 必须提供 TG_BOT_TOKEN 与 TG_CHAT_ID 环境变量！", flush=True)
         sys.exit(1)
 
-    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v4.8 启动完毕...", flush=True)
+    print(f"[{datetime.now()}] 🚀 多社区抽奖与热帖监控 Bot v{APP_VERSION} 启动完毕...", flush=True)
 
     t_tg = threading.Thread(target=telegram_polling_thread, args=(bot,), daemon=True)
     t_tg.start()

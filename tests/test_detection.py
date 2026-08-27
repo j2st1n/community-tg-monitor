@@ -116,6 +116,41 @@ class DetectionRulesTest(unittest.TestCase):
         self.assertEqual("https://sb.sb/t/2917/", topics[0]["link"])
         self.assertEqual("mubdao", topics[0]["author"])
         self.assertEqual("综合", topics[0]["category"])
+        self.assertEqual("redpacket", topics[0]["badge_kind"])
+
+    def test_sbsb_lottery_badge_is_parsed_independently(self):
+        page_html = """
+        <ul class="post-list">
+          <li class="post-item">
+            <span class="topic-badge lottery-badge">抽奖</span>
+            <a class="post-title" href="/t/2859/">面包云 breadcloud jp1.1+us1.1 双机</a>
+            <a href="/u/42/">tester</a><a href="/go/review/">测评</a>
+          </li>
+          <li class="post-item">
+            <span class="topic-badge redpacket-badge">红包</span>
+            <a class="post-title" href="/t/2917/">吃饼了，饼友们！</a>
+          </li>
+        </ul>
+        """
+        topics = main.parse_sbsb_badged_topics(page_html, "lottery")
+        self.assertEqual(1, len(topics))
+        self.assertEqual("https://sb.sb/t/2859/", topics[0]["link"])
+        self.assertEqual("lottery", topics[0]["badge_kind"])
+
+    def test_sbsb_rss_automatic_rules_are_disabled_but_custom_words_remain(self):
+        bot = self.make_bot(keywords=[])
+        matched, kind, _ = bot.evaluate_post(
+            "烧饼论坛", "综合", "【抽奖】送一个小鸡", "", custom_only=True
+        )
+        self.assertFalse(matched)
+        self.assertEqual("none", kind)
+
+        bot = self.make_bot(keywords=["面包云"])
+        matched, kind, _ = bot.evaluate_post(
+            "烧饼论坛", "综合", "面包云新品通知", "", custom_only=True
+        )
+        self.assertTrue(matched)
+        self.assertEqual("custom", kind)
 
 
 class SeenIdPersistenceTest(unittest.TestCase):
@@ -141,6 +176,17 @@ class SeenIdPersistenceTest(unittest.TestCase):
         finally:
             main.SEEN_IDS_FILE = old_path
             main.MAX_SEEN_IDS = old_limit
+
+    def test_sbsb_marker_events_do_not_share_rss_or_badge_deduplication(self):
+        bot = main.BotManager.__new__(main.BotManager)
+        bot.sbsb_events_initialized = True
+        bot.sbsb_event_order = {"lottery": [], "redpacket": []}
+        bot.sbsb_events = {"lottery": set(), "redpacket": set()}
+
+        link = "https://sb.sb/t/2917/"
+        self.assertTrue(bot.remember_sbsb_event("redpacket", link))
+        self.assertFalse(bot.remember_sbsb_event("redpacket", link))
+        self.assertTrue(bot.remember_sbsb_event("lottery", link))
 
 
 if __name__ == "__main__":

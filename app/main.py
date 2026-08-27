@@ -662,42 +662,47 @@ class BotManager:
         hours, remainder = divmod(int(uptime.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
 
-        sources_list = []
-        for s in self.sources:
-            sid = s["id"]
-            is_on = self.source_states.get(sid, True)
-            status_tag = "🟢 开启" if is_on else "🔴 暂停"
-            sources_list.append(f"  • {s['icon']} <b>{s['name']}</b> ({status_tag})")
-        sources_text = "\n".join(sources_list)
+        ns_on = "🟢 开启" if self.source_states.get("nodeseek", True) else "🔴 暂停"
+        sb_on = "🟢 开启" if self.source_states.get("sbsb", True) else "🔴 暂停"
 
-        sbsb_private_status = "🟢 实时运行中（含每日 08:05 自动签到）" if self.sbsb_cookie else "⚪ 未配置 SBSB_COOKIE"
         ai_status = "🟢 运行中" if self.ai_is_ready() else ("🟡 已停用" if self.ai_endpoint and self.ai_model and self.ai_api_key else "⚪ 未配置")
+        sb_checkin_info = "官方标记 + 每日签到" + (f" (UID: {self.sbsb_uid})" if self.sbsb_uid else "")
+        if not self.sbsb_cookie:
+            sb_checkin_info = "官方标记 (未配置 Cookie 签到)"
+
         pause_label = "▶️ 恢复推送" if self.paused else "⏸️ 暂停推送"
         pause_action = "resume" if self.paused else "pause"
 
-        kw_status = f"<b>{len(self.keywords)}</b> 个（最高优先级）" if self.keywords else "未配置（默认不启用）"
+        kw_status = f"<b>{len(self.keywords)}</b> 个 (最高优先级直通)" if self.keywords else "未配置 (默认不启用)"
+
+        stats = dict(self.daily_stats)
+        scanned = stats.get("total_scanned", 0)
+        hits = stats.get("custom_hits", 0) + stats.get("lottery_hits", 0)
+        priv_notified = stats.get("private_notified", 0)
 
         lines = [
-            "📊 <b>多社区监控守护状态</b>",
+            "📊 <b>多社区监控实时守护状态</b>",
             "",
-            f"⏱️ <b>连续运行</b>: {hours}小时 {minutes}分 {seconds}秒",
-            f"🔔 <b>全局推送状态</b>: {'⏸️ 已暂停推送' if self.paused else '▶️ 正常推送中'}",
-            f"📡 <b>轮询周期</b>: 每 {self.poll_interval} 秒",
-            f"🌐 <b>监控网站 ({len(self.sources)})</b>:",
-            sources_text,
-            f"📬 <b>烧饼私信/签到引擎</b>: {sbsb_private_status}",
-            f"🧠 <b>NodeSeek AI</b>: {ai_status}（待判定 {len(self.nodeseek_ai_pending)} 篇）",
-            f"🎯 <b>自定义关注词</b>: {kw_status}",
-            f"📈 <b>去重索引</b>: {len(self.seen_ids)} 篇公开帖 / {len(self.seen_msgs)} 条私信",
-            f"🎁 <b>累计公开帖命中</b>: {self.total_hit} 篇",
-            f"💌 <b>累计私信通知</b>: {self.total_private_notified} 次",
+            f"⏱️ <b>连续运行</b>: {hours}小时 {minutes}分  |  🔔 <b>推送状态</b>: {'⏸️ 已暂停推送' if self.paused else '▶️ 正常推送中'}",
+            f"📡 <b>轮询频率</b>: 每 {self.poll_interval} 秒扫描双源",
+            "",
+            "🌐 <b>监控网站状态</b>",
+            f"• 🌐 <b>NodeSeek</b>: {ns_on} ({ai_status} AI 判定，待处理 {len(self.nodeseek_ai_pending)} 篇)",
+            f"• 🍪 <b>烧饼论坛</b>: {sb_on} ({sb_checkin_info})",
+            "",
+            "🎯 <b>专属关注雷达</b>",
+            f"• 状态: {kw_status}",
+            "",
+            "📈 <b>今日活跃概览</b>",
+            f"• 扫描新帖: <b>{scanned}</b> 篇  |  今日累计命中: <b>{hits}</b> 篇",
+            f"• 烧饼私信提醒: <b>{priv_notified}</b> 次  |  去重索引库: <b>{len(self.seen_ids)}</b> 篇公开帖",
         ]
         text = "\n".join(lines)
         markup = {
             "inline_keyboard": [
                 [
                     {"text": pause_label, "callback_data": f"menu:{pause_action}"},
-                    {"text": "📈 查看今日日报", "callback_data": "menu:report"},
+                    {"text": "📈 查看今日详细日报", "callback_data": "menu:report"},
                 ],
                 [
                     {"text": "📡 网站开关", "callback_data": "menu:sources"},
@@ -756,15 +761,12 @@ class BotManager:
         return text, markup
 
     def generate_daily_report_card(self):
-        """生成每日运行统计与算法成功率报告卡片（无锁安全快照）"""
+        """生成每日运行统计与算法成功率报告卡片（总-分结构，无锁快照）"""
         stats = dict(self.daily_stats)
-        uptime = datetime.now() - self.start_time
-        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        
         scanned = stats.get("total_scanned", 0)
         lottery_hits = stats.get("lottery_hits", 0)
         custom_hits = stats.get("custom_hits", 0)
+        total_captured = custom_hits + lottery_hits
         priv_notified = stats.get("private_notified", 0)
         poll_success = stats.get("poll_success", 0)
         poll_errors = stats.get("poll_errors", 0)
@@ -782,38 +784,37 @@ class BotManager:
         ai_uncertain = stats.get("ai_uncertain", 0)
 
         total_polls = poll_success + poll_errors
-        success_rate = (poll_success / total_polls * 100) if total_polls > 0 else 100.0
+        poll_rate = (poll_success / total_polls * 100) if total_polls > 0 else 100.0
+        total_deliv = delivery_success + delivery_errors
+        deliv_rate = (delivery_success / total_deliv * 100) if total_deliv > 0 else 100.0
         date_str = stats.get("date", self.get_today_cst())
 
-        # 格式化活跃源状态
-        src_status = []
-        for s in self.sources:
-            is_on = self.source_states.get(s["id"], True)
-            src_status.append(f"{s['icon']} {s['name']}: {'🟢' if is_on else '🔴'}")
-        src_line = "  ".join(src_status)
+        ns_is_on = "🟢 开启中" if self.source_states.get("nodeseek", True) else "🔴 已暂停"
+        sb_is_on = "🟢 开启中" if self.source_states.get("sbsb", True) else "🔴 已暂停"
+        sb_checkin_str = f"🟢 运行中" + (f" (UID: {self.sbsb_uid})" if self.sbsb_uid else "") if self.sbsb_cookie else "⚪ 未配置"
 
-        text = (
-            "📈 <b>多社区监控每日运行与算法健康度报告</b>\n"
-            f"📅 <b>统计日期</b>: <code>{date_str}</code> (周期: 24h)\n\n"
-            "🔍 <b>公开帖子扫描与命中分析</b>\n"
-            f"• 📊 <b>全网新发主题</b>: <b>{scanned}</b> 篇\n"
-            f"• 📡 <b>RSS 来源请求</b>: <b>{poll_success}</b> 次 (每30s扫描双源)\n"
-            f"• 🎯 <b>自定义词命中</b>: <b>{custom_hits}</b> 篇 (最高优先级直通)\n"
-            f"• 🎁 <b>抽奖规则命中</b>: <b>{lottery_hits}</b> 篇\n"
-            f"• 🧠 <b>NodeSeek AI 判定</b>: {ai_classified} 篇 / 命中 {ai_giveaway_hits} / 二审 {ai_second_reviews} / 待审 {ai_uncertain}\n"
-            f"• 🔌 <b>AI API 请求</b>: {ai_requests} 次 / 异常 {ai_errors}\n"
-            f"• ✉️ <b>Telegram 送达</b>: <b>{delivery_success}</b> 成功 / <b>{delivery_errors}</b> 失败\n"
-            f"• 📬 <b>私信与互动通知</b>: <b>{priv_notified}</b> 次\n\n"
-            "🌐 <b>各站点推送开关</b>\n"
-            f"• {src_line}\n\n"
-            "⚙️ <b>系统守护健康度</b>\n"
-            f"• ⏱️ <b>连续运行</b>: {hours}小时 {minutes}分\n"
-            f"• 📡 <b>RSS 巡检成功率</b>: <b>{success_rate:.1f}%</b> ({poll_success} 成功 / {poll_errors} 异常)\n"
-            f"• 🏷️ <b>烧饼官方标记巡检</b>: {marker_poll_success} 成功 / {marker_poll_errors} 异常\n"
-            f"• 🎁 <b>烧饼今日标记事件</b>: 抽奖 {sbsb_lottery_events} / 红包 {sbsb_redpacket_events}\n"
-            f"• 🎯 <b>已去重索引容量</b>: {len(self.seen_ids)} 篇帖 / {len(self.seen_msgs)} 条通知"
-        )
-        return text
+        lines = [
+            "📈 <b>多社区监控每日运行与算法日报</b>",
+            f"📅 <b>统计日期</b>: <code>{date_str}</code> (周期: 24h)",
+            "",
+            "📊 <b>【总览】全网数据大盘</b>",
+            f"• 🌐 全网新发主题: <b>{scanned}</b> 篇",
+            f"• 🎁 累计捕获推送: <b>{total_captured}</b> 篇 (关注直通 {custom_hits} / 福利抽奖 {lottery_hits})",
+            f"• ✉️ Telegram 送达: <b>{delivery_success}</b> 成功 / <b>{delivery_errors}</b> 失败 (成功率 {deliv_rate:.1f}%)",
+            f"• 📡 采集巡检成功率: <b>{poll_rate:.1f}%</b> ({poll_success} 成功 / {poll_errors} 异常)",
+            "",
+            "🌐 <b>【NodeSeek】AI 语义驱动</b>",
+            f"• 📡 监控状态: {ns_is_on} (全站实时流)",
+            f"• 🧠 AI 判定总数: <b>{ai_classified}</b> 篇 (API 请求 {ai_requests} 次 / 异常 {ai_errors})",
+            f"• 🎯 判定结果分布: 抽奖命中 <b>{ai_giveaway_hits}</b> 篇 | 边界二审 <b>{ai_second_reviews}</b> 篇 | 存疑待审 <b>{ai_uncertain}</b> 篇",
+            "",
+            "🍪 <b>【烧饼论坛】官方标记与签到</b>",
+            f"• 📡 监控状态: {sb_is_on} (RSS 30s + 官方标记 5m)",
+            f"• 🎁 官方标记事件: 抽奖 <b>{sbsb_lottery_events}</b> 篇 | 红包 <b>{sbsb_redpacket_events}</b> 个 (巡检 {marker_poll_success} 次 / 异常 {marker_poll_errors})",
+            f"• 📬 私信与互动通知: <b>{priv_notified}</b> 次提醒",
+            f"• 🍪 每日自动签到: {sb_checkin_str}",
+        ]
+        return "\n".join(lines)
 
 
 def make_keyword_buttons(keywords, prefix="del_kw"):

@@ -158,6 +158,19 @@ class BotManager:
             if not self.sources:
                 print(f"[{datetime.now()}] ⚠️ 环境变量 MONITOR_SOURCES 过滤后无有效源，恢复默认全源。", flush=True)
                 self.sources = list(DEFAULT_SOURCES)
+
+        # AI 环境变量注入支持
+        self.env_ai_endpoint = (os.environ.get("AI_ENDPOINT") or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or "").strip()
+        self.env_ai_api_key = (os.environ.get("AI_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip()
+        self.env_ai_model = os.environ.get("AI_MODEL", "").strip()
+        self.env_ai_judge_model = os.environ.get("AI_JUDGE_MODEL", "").strip()
+        env_threshold = os.environ.get("AI_ACCEPT_THRESHOLD", "").strip()
+        try:
+            self.env_ai_accept_threshold = float(env_threshold) if env_threshold else None
+        except ValueError:
+            self.env_ai_accept_threshold = None
+        env_enabled = os.environ.get("AI_ENABLED", "").strip().lower()
+        self.env_ai_enabled = (env_enabled in ("1", "true", "yes", "on")) if env_enabled else None
         
         self.load_settings()
         self.ai_api_key = self.load_ai_secret()
@@ -299,21 +312,34 @@ class BotManager:
                         sid = s["id"]
                         if sid in saved_source_states:
                             self.source_states[sid] = bool(saved_source_states[sid])
-                    return
             except Exception as e:
                 print(f"[{datetime.now()}] 读取 settings.json 异常: {e}", flush=True)
-        
-        self.keywords = list(DEFAULT_KEYWORDS)
-        self.blockwords = list(DEFAULT_BLOCKWORDS)
-        self.poll_interval = DEFAULT_POLL_INTERVAL
-        self.paused = False
-        self.ai_enabled = False
-        self.ai_endpoint = ""
-        self.ai_model = ""
-        self.ai_judge_model = ""
-        self.ai_accept_threshold = 0.90
-        self.source_states = {s["id"]: True for s in self.sources}
-        self.save_settings()
+        else:
+            self.keywords = list(DEFAULT_KEYWORDS)
+            self.blockwords = list(DEFAULT_BLOCKWORDS)
+            self.poll_interval = DEFAULT_POLL_INTERVAL
+            self.paused = False
+            self.ai_enabled = False
+            self.ai_endpoint = ""
+            self.ai_model = ""
+            self.ai_judge_model = ""
+            self.ai_accept_threshold = 0.90
+            self.source_states = {s["id"]: True for s in self.sources}
+            self.save_settings()
+
+        # 环境变量优先覆盖与默认激活
+        if self.env_ai_endpoint:
+            self.ai_endpoint = self.env_ai_endpoint
+        if self.env_ai_model:
+            self.ai_model = self.env_ai_model
+        if self.env_ai_judge_model:
+            self.ai_judge_model = self.env_ai_judge_model
+        if self.env_ai_accept_threshold is not None:
+            self.ai_accept_threshold = min(0.99, max(0.70, self.env_ai_accept_threshold))
+        if self.env_ai_enabled is not None:
+            self.ai_enabled = self.env_ai_enabled
+        elif not self.ai_enabled and self.env_ai_api_key and self.ai_endpoint and self.ai_model:
+            self.ai_enabled = True
 
     def save_settings(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -333,6 +359,8 @@ class BotManager:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def load_ai_secret(self):
+        if self.env_ai_api_key:
+            return self.env_ai_api_key
         if os.path.exists(AI_SECRET_FILE):
             try:
                 with open(AI_SECRET_FILE, "r", encoding="utf-8") as f:
@@ -343,6 +371,8 @@ class BotManager:
         return ""
 
     def save_ai_secret(self, api_key):
+        if self.env_ai_api_key:
+            return
         os.makedirs(DATA_DIR, exist_ok=True)
         temp_path = f"{AI_SECRET_FILE}.tmp"
         fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -416,6 +446,10 @@ class BotManager:
     def masked_ai_key(self):
         if not self.ai_api_key:
             return "未设置"
+        if self.env_ai_api_key:
+            if len(self.ai_api_key) <= 8:
+                return "🔒 .env 环境变量注入 (••••••••)"
+            return f"🔒 .env 注入 ({self.ai_api_key[:3]}••••{self.ai_api_key[-4:]})"
         if len(self.ai_api_key) <= 8:
             return "••••••••"
         return f"{self.ai_api_key[:3]}••••{self.ai_api_key[-4:]}"
@@ -423,17 +457,32 @@ class BotManager:
     def format_ai_card(self):
         configured = bool(self.ai_endpoint and self.ai_model and self.ai_api_key)
         running = self.ai_is_ready()
-        text = (
-            "🧠 <b>NodeSeek AI 抽奖判定</b>\n\n"
-            f"• 状态: {'🟢 运行中' if running else ('🟡 已配置但未启用' if configured else '⚪ 配置未完成')}\n"
-            f"• API: <code>{html.escape(self.ai_endpoint or '未设置')}</code>\n"
-            f"• 模型: <code>{html.escape(self.ai_model or '未设置')}</code>\n"
-            f"• 复审模型: <code>{html.escape(self.ai_judge_model or '跟随主模型')}</code>\n"
-            f"• API Key: <code>{html.escape(self.masked_ai_key())}</code>\n"
-            f"• 自动通过阈值: <code>{self.ai_accept_threshold:.2f}</code>\n"
-            f"• 待判定队列: <b>{len(self.nodeseek_ai_pending)}</b> 篇\n\n"
-            "<i>NodeSeek 不使用关键词预筛。每篇新帖先做结构化事实抽取，边界案例再独立复审。</i>"
-        )
+        source_tags = []
+        if self.env_ai_api_key:
+            source_tags.append("Key")
+        if self.env_ai_endpoint:
+            source_tags.append("API")
+        if self.env_ai_model:
+            source_tags.append("模型")
+        env_source_desc = f"🔒 .env 注入 ({', '.join(source_tags)})" if source_tags else "本地存储"
+
+        status_text = '🟢 运行中' if running else ('🟡 已配置但未启用' if configured else '⚪ 配置未完成')
+        judge_text = self.ai_judge_model or '跟随主模型'
+        lines = [
+            "🧠 <b>NodeSeek AI 抽奖判定</b>",
+            "",
+            f"• 状态: {status_text}",
+            f"• 配置来源: <code>{env_source_desc}</code>",
+            f"• API: <code>{html.escape(self.ai_endpoint or '未设置')}</code>",
+            f"• 模型: <code>{html.escape(self.ai_model or '未设置')}</code>",
+            f"• 复审模型: <code>{html.escape(judge_text)}</code>",
+            f"• API Key: <code>{html.escape(self.masked_ai_key())}</code>",
+            f"• 自动通过阈值: <code>{self.ai_accept_threshold:.2f}</code>",
+            f"• 待判定队列: <b>{len(self.nodeseek_ai_pending)}</b> 篇",
+            "",
+            "<i>💡 最佳实践：直接在服务器 .env 中配置 <code>AI_API_KEY</code> 等变量，安全且无需在对话框输入任何密钥。</i>"
+        ]
+        text = chr(10).join(lines)
         markup = {
             "inline_keyboard": [
                 [
@@ -608,6 +657,23 @@ class BotManager:
                 return resp.status == 200
         except Exception as e:
             print(f"[{datetime.now()}] 编辑消息失败: {e}", flush=True)
+            return False
+
+    def delete_msg(self, chat_id, message_id):
+        if not self.bot_token or not chat_id or not message_id:
+            return False
+        api_url = f"https://api.telegram.org/bot{self.bot_token}/deleteMessage"
+        payload = {"chat_id": chat_id, "message_id": message_id}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            api_url,
+            data=data,
+            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return resp.status == 200
+        except Exception:
             return False
 
     def answer_callback_query(self, callback_query_id, text):
@@ -1014,24 +1080,56 @@ def handle_callback_query(bot, query):
         bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
 
     elif data == "ai:set_endpoint":
-        bot.user_states[chat_id] = "waiting_for_ai_endpoint"
-        bot.answer_callback_query(query_id, "请发送 API 地址")
-        bot.send_msg(
-            chat_id,
-            "🔌 <b>请输入 OpenAI-compatible API 地址</b>\n"
-            "例如：<code>https://api.example.com/v1</code>\n"
-            "也可以直接填写完整的 <code>/chat/completions</code> 地址。",
-        )
+        if bot.env_ai_endpoint:
+            bot.answer_callback_query(query_id, "已由环境变量锁定")
+            bot.send_msg(
+                chat_id,
+                f"🔒 <b>API 地址已由系统环境变量 <code>AI_ENDPOINT</code> 锁定：</b>\n"
+                f"<code>{html.escape(bot.env_ai_endpoint)}</code>\n\n"
+                f"如需更改，请直接修改服务器 <code>.env</code> 文件并重启容器。"
+            )
+        else:
+            bot.user_states[chat_id] = "waiting_for_ai_endpoint"
+            bot.answer_callback_query(query_id, "请发送 API 地址")
+            bot.send_msg(
+                chat_id,
+                "🔌 <b>请输入 OpenAI-compatible API 地址</b>\n"
+                "例如：<code>https://api.openai.com/v1</code>\n"
+                "也可以直接填写完整的 <code>/chat/completions</code> 地址。\n\n"
+                "<i>💡 推荐直接在 .env 文件中设置 <code>AI_ENDPOINT</code></i>",
+            )
 
     elif data == "ai:set_key":
-        bot.user_states[chat_id] = "waiting_for_ai_key"
-        bot.answer_callback_query(query_id, "请发送 API Key")
-        bot.send_msg(chat_id, "🔑 <b>请输入 API Key</b>\n<i>密钥将单独保存且不会在消息或日志中完整显示。</i>")
+        if bot.env_ai_api_key:
+            bot.answer_callback_query(query_id, "Key 已由环境变量锁定")
+            bot.send_msg(
+                chat_id,
+                "🔒 <b>API Key 已由系统环境变量 <code>AI_API_KEY</code> 注入锁定</b>\n\n"
+                "零对话框泄露风险。如需更换，请直接修改服务器 <code>.env</code> 文件并重启容器。"
+            )
+        else:
+            bot.user_states[chat_id] = "waiting_for_ai_key"
+            bot.answer_callback_query(query_id, "请发送 API Key")
+            bot.send_msg(
+                chat_id,
+                "🔑 <b>请输入 API Key</b>\n\n"
+                "<i>💡 最佳实践：推荐直接在服务器 <code>.env</code> 中配置 <code>AI_API_KEY</code>，完全无需在对话框输入。\n"
+                "若在此处发送，Bot 接收后会<b>立即自动删除你的原消息</b>以防留下聊天记录。</i>",
+            )
 
     elif data == "ai:set_model":
-        bot.user_states[chat_id] = "waiting_for_ai_model"
-        bot.answer_callback_query(query_id, "请发送模型名")
-        bot.send_msg(chat_id, "🤖 <b>请输入主模型名称</b>\n例如：<code>gpt-4.1-mini</code>")
+        if bot.env_ai_model:
+            bot.answer_callback_query(query_id, "模型已由环境变量锁定")
+            bot.send_msg(
+                chat_id,
+                f"🔒 <b>主模型已由环境变量 <code>AI_MODEL</code> 锁定：</b>\n"
+                f"<code>{html.escape(bot.env_ai_model)}</code>\n\n"
+                f"如需更改，请直接修改服务器 <code>.env</code> 文件并重启容器。"
+            )
+        else:
+            bot.user_states[chat_id] = "waiting_for_ai_model"
+            bot.answer_callback_query(query_id, "请发送模型名")
+            bot.send_msg(chat_id, "🤖 <b>请输入主模型名称</b>\n例如：<code>gpt-4o-mini</code> 或 <code>deepseek-chat</code>\n\n<i>💡 推荐直接在 .env 中设置 <code>AI_MODEL</code></i>")
 
     elif data == "ai:set_judge":
         bot.user_states[chat_id] = "waiting_for_ai_judge"
@@ -1152,7 +1250,7 @@ def handle_callback_query(bot, query):
                 text, markup = bot.format_blocks_card()
                 bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
 
-def handle_command_or_text(bot, chat_id, text):
+def handle_command_or_text(bot, chat_id, text, message_id=None):
     text = text.strip()
 
     if chat_id in bot.user_states and not text.startswith("/"):
@@ -1172,6 +1270,14 @@ def handle_command_or_text(bot, chat_id, text):
             return
 
         if state == "waiting_for_ai_key":
+            if message_id:
+                bot.delete_msg(chat_id, message_id)
+            if bot.env_ai_api_key:
+                bot.send_msg(
+                    chat_id,
+                    "🔒 <b>API Key 已由系统环境变量锁定，无需在对话框中设置（包含密钥的原消息已自动销毁）。</b>"
+                )
+                return
             api_key = text.strip()
             if not api_key or len(api_key) > 1000:
                 bot.send_msg(chat_id, "❌ <b>API Key 不能为空或过长。</b>")
@@ -1181,7 +1287,7 @@ def handle_command_or_text(bot, chat_id, text):
                     record["next_retry_at"] = 0
                 bot.save_nodeseek_ai_state()
                 msg_text, markup = bot.format_ai_card()
-                bot.send_msg(chat_id, f"✅ <b>API Key 已安全保存</b>\n\n{msg_text}", reply_markup=markup)
+                bot.send_msg(chat_id, f"✅ <b>API Key 已安全保存（包含密钥的消息已自动销毁）</b>\n\n{msg_text}", reply_markup=markup)
             return
 
         if state == "waiting_for_ai_model":
@@ -1457,9 +1563,10 @@ def telegram_polling_thread(bot):
                             msg = result["message"]
                             from_user = str(msg.get("chat", {}).get("id", ""))
                             text = msg.get("text", "")
+                            message_id = msg.get("message_id")
                             if from_user == bot.admin_chat_id and text:
                                 try:
-                                    handle_command_or_text(bot, from_user, text)
+                                    handle_command_or_text(bot, from_user, text, message_id=message_id)
                                 except Exception as ce:
                                     print(f"[{datetime.now()}] 指令处理异常: {ce}", flush=True)
         except urllib.error.HTTPError as he:

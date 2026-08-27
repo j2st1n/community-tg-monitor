@@ -58,6 +58,12 @@
 | `TG_BOT_TOKEN` | **必填** | 无 | 你的 Telegram Bot API Token，用于发送消息和接收指令交互 |
 | `TG_CHAT_ID` | **必填** | 无 | 你的 Telegram 个人纯数字 UID（仅允许管理员本人操作并接收私信推送） |
 | `SBSB_COOKIE` | *可选* | 空 | 烧饼论坛登录 Cookie（填入后自动激活每日 08:05 签到、查分与私信/回帖通知） |
+| `AI_API_KEY` | *可选* | 空 | OpenAI-compatible API Key（推荐直接在 .env 注入，免除在 TG 对话框输入密钥） |
+| `AI_ENDPOINT` | *可选* | 空 | API 基础地址，如 `https://api.openai.com/v1` 或 `https://api.deepseek.com/v1` |
+| `AI_MODEL` | *可选* | 空 | 主抽取与判定模型名称（如 `gpt-4o-mini`, `deepseek-chat`） |
+| `AI_JUDGE_MODEL` | *可选* | 空 | 边界案例独立复审模型（留空默认跟随主模型） |
+| `AI_ACCEPT_THRESHOLD` | *可选* | `0.90` | 自动通过置信度阈值（范围 0.70～0.99） |
+| `AI_ENABLED` | *可选* | `true` | 是否启用 NodeSeek AI 语义判定（配置上述三项后默认激活） |
 | `MONITOR_SOURCES` | *可选* | `nodeseek,sbsb` | 启用的公开源，可用逗号分隔过滤（支持 `nodeseek`, `sbsb`） |
 | `DATA_DIR` | *可选* | `/app/data` | 数据持久化存储路径 |
 

@@ -1,3 +1,5 @@
+import os
+import tempfile
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
@@ -182,3 +184,48 @@ class AIQueueIntegrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AIEnvConfigTest(unittest.TestCase):
+    @patch.dict(
+        os.environ,
+        {
+            "AI_ENDPOINT": "https://api.openai.com/v1",
+            "AI_API_KEY": "sk-env-test-key-123456",
+            "AI_MODEL": "gpt-4o-mini",
+            "AI_JUDGE_MODEL": "gpt-4o-judge",
+            "AI_ACCEPT_THRESHOLD": "0.88",
+            "AI_ENABLED": "true",
+        },
+    )
+    def test_env_vars_override_settings(self):
+        bot = main.BotManager.__new__(main.BotManager)
+        bot.sources = list(main.DEFAULT_SOURCES)
+        bot.source_states = {s["id"]: True for s in main.DEFAULT_SOURCES}
+        bot.lock = threading.RLock()
+        bot.env_ai_endpoint = os.environ.get("AI_ENDPOINT", "").strip()
+        bot.env_ai_api_key = os.environ.get("AI_API_KEY", "").strip()
+        bot.env_ai_model = os.environ.get("AI_MODEL", "").strip()
+        bot.env_ai_judge_model = os.environ.get("AI_JUDGE_MODEL", "").strip()
+        bot.env_ai_accept_threshold = float(os.environ.get("AI_ACCEPT_THRESHOLD", 0.90))
+        bot.env_ai_enabled = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_data_dir = main.DATA_DIR
+            old_settings_file = main.SETTINGS_FILE
+            try:
+                main.DATA_DIR = tmpdir
+                main.SETTINGS_FILE = os.path.join(tmpdir, "settings.json")
+                bot.load_settings()
+                bot.ai_api_key = bot.load_ai_secret()
+
+                self.assertEqual("https://api.openai.com/v1", bot.ai_endpoint)
+                self.assertEqual("sk-env-test-key-123456", bot.ai_api_key)
+                self.assertEqual("gpt-4o-mini", bot.ai_model)
+                self.assertEqual("gpt-4o-judge", bot.ai_judge_model)
+                self.assertAlmostEqual(0.88, bot.ai_accept_threshold)
+                self.assertTrue(bot.ai_enabled)
+                self.assertIn(".env 注入", bot.masked_ai_key())
+            finally:
+                main.DATA_DIR = old_data_dir
+                main.SETTINGS_FILE = old_settings_file

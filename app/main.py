@@ -5,6 +5,7 @@ import time
 import json
 import html
 import re
+import hashlib
 import traceback
 import threading
 import urllib.request
@@ -1724,6 +1725,171 @@ def daily_quality_reporter_thread(bot):
         time.sleep(300)
 
 
+def parse_sbsb_notifications(html_text, default_uid=""):
+    """
+    解析烧饼论坛 (sb.sb) 互动通知页面 HTML。
+
+    优化项：
+    1. 精确匹配闭合的 </li>，识别 .notification-read-divider 分割线并标定已读状态。
+    2. 兼容各种 <time> 属性（如 data-abs="date", class 等），未匹配时严禁兜底“刚刚”。
+    3. 提取 /u/{uid}/ 中的用户名，剥离 SVG 等内部图标，杜绝误用 post-title。
+    4. 业务去重主键解耦时间字段：优先提取 link/block 中的 reply_id 生成 notif:reply_{id}，
+       无 reply_id 时使用路径与通知关键内容的 SHA-256 哈希生成 notif:hash_{digest}。
+    """
+    if not html_text:
+        return []
+
+    # 1. 检测已读分割线位置
+    divider_m = re.search(
+        r'<[^>]*class=[\"\'][^\"\']*notification-read-divider[^\"\']*[\"\'][^>]*>',
+        html_text,
+        re.IGNORECASE
+    )
+    divider_pos = divider_m.start() if divider_m else None
+
+    # 2. 精确提取闭合的 <li class="...notification-item...">...</li>
+    item_pattern = re.compile(
+        r'<li\b([^>]*class=[\"\'][^\"\']*notification-item[^\"\']*[\"\'][^>]*)>(.*?)</li>',
+        re.DOTALL | re.IGNORECASE
+    )
+
+    notifications = []
+
+    for match in item_pattern.finditer(html_text):
+        li_attrs = match.group(1)
+        block = match.group(2)
+        item_start = match.start()
+
+        # 判断是否已读：位于已读分割线之后，或 li 属性包含 read class
+        is_read = False
+        if divider_pos is not None and item_start > divider_pos:
+            is_read = True
+        else:
+            class_m = re.search(r'class=[\"\']([^\"\']+)[\"\']', li_attrs, re.IGNORECASE)
+            if class_m:
+                classes = set(class_m.group(1).split())
+                if "read" in classes and "unread" not in classes:
+                    is_read = True
+
+        # 3. 提取用户名：匹配 /u/{uid}/ 链接，剥离内部 SVG 图标，杜绝误用 post-title
+        user = ""
+        user_link_match = re.search(
+            r'<a\b[^>]*href=[\"\'](?:https?://[^/]+)?/u/([^/\"\'\?#]+)/?[\"\'][^>]*>(.*?)</a>',
+            block,
+            re.DOTALL | re.IGNORECASE
+        )
+        if user_link_match:
+            uid_or_name = user_link_match.group(1)
+            raw_user_html = user_link_match.group(2)
+            no_svg = re.sub(r'<svg\b[^>]*>.*?</svg>', '', raw_user_html, flags=re.DOTALL | re.IGNORECASE)
+            clean_user = re.sub(r'<[^>]+>', '', no_svg).strip()
+            if clean_user:
+                user = clean_user
+            else:
+                attr_m = re.search(r'(?:title|aria-label|data-username)=[\"\']([^\"\']+)[\"\']', user_link_match.group(0), re.IGNORECASE)
+                user = attr_m.group(1).strip() if attr_m else (uid_or_name or "烧饼用户")
+
+        if not user:
+            # 备用匹配非 post-title 的 user/author 类链接
+            alt_m = re.search(
+                r'<a\b(?![^>]*class=[\"\'][^\"\']*post-title[^\"\']*[\"\'])[^>]*class=[\"\'][^\"\']*(?:user|author)[^\"\']*[\"\'][^>]*>(.*?)</a>',
+                block,
+                re.DOTALL | re.IGNORECASE
+            )
+            if alt_m:
+                no_svg = re.sub(r'<svg\b[^>]*>.*?</svg>', '', alt_m.group(1), flags=re.DOTALL | re.IGNORECASE)
+                clean_alt = re.sub(r'<[^>]+>', '', no_svg).strip()
+                if clean_alt:
+                    user = clean_alt
+
+        if not user:
+            user = "烧饼用户"
+
+        # 4. 提取通知类型
+        kind_match = re.search(r'<span[^>]*class=[\"\'][^\"\']*notification-kind[^\"\']*[\"\'][^>]*>([^<]+)</span>', block, re.IGNORECASE)
+        kind = kind_match.group(1).strip() if kind_match else "提醒"
+
+        # 5. 提取时间：兼容 data-abs="date"、class 等属性；失配时严禁兜底“刚刚”
+        time_match = re.search(r'<time\b([^>]*)>(.*?)</time>', block, re.DOTALL | re.IGNORECASE)
+        if time_match:
+            time_attrs = time_match.group(1)
+            time_content = time_match.group(2)
+            dt_m = re.search(r'datetime=[\"\']([^\"\']+)[\"\']', time_attrs, re.IGNORECASE)
+            iso_time = dt_m.group(1).strip() if dt_m else ""
+            rel_time = re.sub(r'<[^>]+>', '', time_content).strip()
+        else:
+            iso_time = ""
+            rel_time = ""  # 匹配失败时严禁兜底赋值“刚刚”
+
+        # 6. 提取通知内容
+        content_match = re.search(r'<div[^>]*class=[\"\'][^\"\']*notification-content[^\"\']*[\"\'][^>]*>(.*?)</div>', block, re.DOTALL | re.IGNORECASE)
+        if content_match:
+            content_raw = content_match.group(1)
+            content = re.sub(r'<[^>]+>', ' ', content_raw)
+            content = re.sub(r'\s+', ' ', content).strip()
+        else:
+            content = "收到一条新的互动提醒"
+
+        # 7. 提取直达链接与 reply_id
+        link_match = (
+            re.search(r'<a[^>]*class=[\"\'][^\"\']*notification-reply-action[^\"\']*[\"\'][^>]*href=[\"\']([^\"\']+)[\"\']', block, re.IGNORECASE)
+            or re.search(r'<a[^>]*href=[\"\'](/t/\d+/[^\"\']*)[\"\']', block, re.IGNORECASE)
+            or re.search(r'href=[\"\'](/t/\d+/[^\"\']*)[\"\']', block, re.IGNORECASE)
+            or re.search(r'href=[\"\'](/t/\d+/?[\"\']?)', block, re.IGNORECASE)
+        )
+        if link_match:
+            raw_href = link_match.group(1)
+            if raw_href.startswith("http://") or raw_href.startswith("https://"):
+                link = raw_href
+            else:
+                if not raw_href.startswith("/"):
+                    raw_href = "/" + raw_href
+                link = f"https://sb.sb{raw_href}"
+        else:
+            link = f"https://sb.sb/u/{default_uid}/?tab=notifications" if default_uid else "https://sb.sb/"
+
+        # 提取 reply_id
+        reply_id = None
+        reply_m = (
+            re.search(r'reply[-_]?id=(\d+)', link, re.IGNORECASE)
+            or re.search(r'reply[-_](\d+)', link, re.IGNORECASE)
+            or re.search(r'[?&]reply=(\d+)', link, re.IGNORECASE)
+            or re.search(r'/reply/(\d+)', link, re.IGNORECASE)
+            or re.search(r'#(?:reply[-_]?|r)?(\d+)', link, re.IGNORECASE)
+        )
+        if reply_m:
+            reply_id = reply_m.group(1)
+
+        if not reply_id:
+            data_reply_m = re.search(r'data-reply(?:-|_)?id=[\"\'](\d+)[\"\']', li_attrs + " " + block, re.IGNORECASE)
+            if data_reply_m:
+                reply_id = data_reply_m.group(1)
+
+        # 8. 构造去重主键（彻底与时间解耦）
+        if reply_id:
+            unique_key = f"notif:reply_{reply_id}"
+        else:
+            path = urllib.parse.urlparse(link).path or link
+            raw_key_material = f"{path}|{user}|{kind}|{content}"
+            digest = hashlib.sha256(raw_key_material.encode("utf-8")).hexdigest()
+            unique_key = f"notif:hash_{digest}"
+
+        notifications.append({
+            "user": user,
+            "kind": kind,
+            "content": content,
+            "iso_time": iso_time,
+            "rel_time": rel_time,
+            "link": link,
+            "reply_id": reply_id,
+            "unique_key": unique_key,
+            "is_read": is_read,
+            "block": block,
+        })
+
+    return notifications
+
+
 def sbsb_private_messages_thread(bot):
     """烧饼论坛互动通知（回复/点赞/提及）与私信轮询线程"""
     if not bot.sbsb_cookie:
@@ -1804,33 +1970,23 @@ def sbsb_private_messages_thread(bot):
                 continue
 
             # 解析通知列表
-            notif_blocks = re.findall(r'<li[^>]*class=\"[^\"]*notification-item[^\"]*\"[^>]*>(.*?)(?=<li[^>]*class=\"[^\"]*notification-item|$)', html_notif, re.DOTALL)
-            
-            for block in reversed(notif_blocks):
-                user_match = re.search(r'<a[^>]*class=\"[^\"]*post-title[^\"]*\"[^>]*>([^<]+)</a>', block)
-                user = user_match.group(1).strip() if user_match else "烧饼用户"
+            notifications = parse_sbsb_notifications(html_notif, default_uid=uid)
 
-                kind_match = re.search(r'<span[^>]*class=\"[^\"]*notification-kind[^\"]*\"[^>]*>([^<]+)</span>', block)
-                kind = kind_match.group(1).strip() if kind_match else "提醒"
-
-                time_match = re.search(r'<time datetime=\"([^\"]+)\">([^<]+)</time>', block)
-                iso_time = time_match.group(1).strip() if time_match else ""
-                rel_time = time_match.group(2).strip() if time_match else "刚刚"
-
-                content_match = re.search(r'<div[^>]*class=\"[^\"]*notification-content[^\"]*\"[^>]*>(.*?)</div>', block, re.DOTALL)
-                if content_match:
-                    content_raw = content_match.group(1)
-                    content = re.sub(r'<[^>]+>', ' ', content_raw)
-                    content = re.sub(r'\s+', ' ', content).strip()
-                else:
-                    content = "收到一条新的互动提醒"
-
-                link_match = re.search(r'<a[^>]*class=\"[^\"]*notification-reply-action[^\"]*\"[^>]*href=\"([^\"]+)\"', block) or re.search(r'href=\"(/t/\d+/[^\"]*)\"', block)
-                link = f"https://sb.sb{link_match.group(1)}" if link_match else f"https://sb.sb/u/{uid}/?tab=notifications"
-
-                unique_key = f"notif:{iso_time}_{user}_{kind}"
+            for notif in reversed(notifications):
+                user = notif["user"]
+                kind = notif["kind"]
+                content = notif["content"]
+                rel_time = notif["rel_time"]
+                link = notif["link"]
+                unique_key = notif["unique_key"]
+                is_read = notif.get("is_read", False)
 
                 if first_run:
+                    bot.remember_seen_msg(unique_key)
+                    continue
+
+                if is_read:
+                    # 识别已读分割线后的历史已读通知，仅记录去重 key，不向 TG 重复推送
                     bot.remember_seen_msg(unique_key)
                     continue
 
@@ -1839,11 +1995,12 @@ def sbsb_private_messages_thread(bot):
                     bot.record_stat("private_notified")
                     print(f"[{datetime.now()}] 📬 命中烧饼论坛新互动通知: [{kind}] {user} - {content}", flush=True)
 
+                    time_display = rel_time if rel_time else "未知时间"
                     msg_card = (
                         f"📬 <b>🍪 [烧饼论坛] 收到新的互动通知！</b>\n\n"
                         f"👤 <b>用户</b>: {user}  |  🏷️ <b>类型</b>: #{kind}\n"
                         f"💬 <b>内容</b>: {content}\n"
-                        f"🕒 <b>时间</b>: {rel_time}\n\n"
+                        f"🕒 <b>时间</b>: {time_display}\n\n"
                         f"🔗 <b>直达链接</b>: {link}"
                     )
                     bot.send_msg(bot.admin_chat_id, msg_card, disable_preview=False)

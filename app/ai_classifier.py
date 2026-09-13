@@ -111,6 +111,36 @@ def validate_facts(raw):
     }
 
 
+def infer_giveaway_subtype(facts, post=None):
+    """
+    根据抽取事实及帖子元数据确定赠送类型子类：
+    - 'redpacket': 红包
+    - 'lottery': 随机抽取/抽奖 (allocation == 'random' 或特征明显)
+    - 'welfare': 福利/直接赠送 (先到先得、直接赠送、人人有份兑换码等)
+    """
+    if not isinstance(facts, dict):
+        return "lottery"
+
+    title = (post.get("title", "") if isinstance(post, dict) else "")
+    if re.search(r"红包|口令", title, re.IGNORECASE):
+        return "redpacket"
+
+    allocation = facts.get("allocation")
+    method = (facts.get("participation") or {}).get("method")
+
+    if allocation == "random":
+        return "lottery"
+    if allocation in {"first_come", "direct_gift", "all"}:
+        return "welfare"
+    if method in {"first_come", "direct_claim"}:
+        return "welfare"
+
+    if re.search(r"抽奖|抽\s*\d|抽个|抽奖品|随机抽取", title):
+        return "lottery"
+
+    return "welfare"
+
+
 def decide_extraction(facts, accept_threshold=0.90, review_threshold=0.65):
     """Apply deterministic policy to extracted facts before any optional review."""
     state = facts["event_state"]
@@ -260,8 +290,10 @@ class OpenAICompatibleClassifier:
         facts = self.extract_facts(post)
         policy, reason = decide_extraction(facts, accept_threshold, review_threshold)
         if policy == "accept":
+            sub_type = infer_giveaway_subtype(facts, post)
             return {
                 "decision": "giveaway",
+                "sub_type": sub_type,
                 "confidence": facts["confidence"],
                 "reason": reason,
                 "evidence": facts["evidence"],
@@ -271,6 +303,7 @@ class OpenAICompatibleClassifier:
         if policy == "reject":
             return {
                 "decision": "not_giveaway",
+                "sub_type": None,
                 "confidence": facts["confidence"],
                 "reason": reason,
                 "evidence": facts["evidence"],
@@ -281,12 +314,16 @@ class OpenAICompatibleClassifier:
         review = self.review(post, facts)
         if review["decision"] == "giveaway" and review["confidence"] >= 0.85:
             final_decision = "giveaway"
+            sub_type = infer_giveaway_subtype(facts, post)
         elif review["decision"] == "not_giveaway" and review["confidence"] >= 0.80:
             final_decision = "not_giveaway"
+            sub_type = None
         else:
             final_decision = "uncertain"
+            sub_type = None
         return {
             "decision": final_decision,
+            "sub_type": sub_type,
             "confidence": review["confidence"],
             "reason": review["reason"] or reason,
             "evidence": review["evidence"] or facts["evidence"],

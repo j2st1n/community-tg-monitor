@@ -1534,6 +1534,7 @@ def deliver_public_match(bot, source_name, source_icon, category, title, author,
     bot.total_hit += 1
     hit_badges = {
         "lottery": "🎁 [抽奖]",
+        "welfare": "🎉 [福利]",
         "redpacket": "🧧 [红包]",
         "custom": "🎯 [自定义关注]",
     }
@@ -1541,7 +1542,7 @@ def deliver_public_match(bot, source_name, source_icon, category, title, author,
     print(f"[{datetime.now()}] {hit_badge} 命中: [{source_name}] [{category}] {title} ({hit_reason})", flush=True)
 
     summary = desc[:140] + ("..." if len(desc) > 140 else "")
-    event_name = {"lottery": "抽奖", "redpacket": "红包", "custom": "专属关注"}.get(hit_type, "抽奖/福利")
+    event_name = {"lottery": "抽奖", "welfare": "福利", "redpacket": "红包", "custom": "专属关注"}.get(hit_type, "抽奖/福利")
     msg = (
         f"{hit_badge.split()[0]} <b>{source_icon} [{source_name}] 发现{event_name}新帖！</b>\n\n"
         f"📌 <b>标题</b>: {title}\n"
@@ -1605,10 +1606,16 @@ def process_nodeseek_ai_queue(bot):
             bot.record_stat("ai_second_reviews")
         decision = result.get("decision")
         if decision == "giveaway":
+            sub_type = result.get("sub_type") or "lottery"
             bot.record_stat("ai_giveaway_hits")
             bot.record_stat("lottery_hits")
+            if sub_type == "welfare":
+                bot.record_stat("welfare_hits")
+            elif sub_type == "redpacket":
+                bot.record_stat("redpacket_hits")
             evidence = "；".join(result.get("evidence", [])[:2])
-            reason = result.get("reason", "AI 语义判定为有效抽奖")
+            default_reason = "AI 语义判定为有效抽奖" if sub_type == "lottery" else "AI 语义判定为有效福利活动"
+            reason = result.get("reason", default_reason)
             if evidence:
                 reason = f"{reason}；证据：{evidence}"
             if not bot.paused:
@@ -1621,7 +1628,7 @@ def process_nodeseek_ai_queue(bot):
                     record.get("author", "未知"),
                     record.get("description", ""),
                     record.get("link", ""),
-                    "lottery",
+                    sub_type,
                     f"AI 双阶段语义判定（置信度 {result.get('confidence', 0):.2f}）：{reason}",
                 )
         elif decision == "uncertain":
@@ -1632,6 +1639,7 @@ def process_nodeseek_ai_queue(bot):
             "title": record.get("title", ""),
             "link": record.get("link", ""),
             "decision": decision,
+            "sub_type": result.get("sub_type"),
             "confidence": result.get("confidence", 0),
             "reason": result.get("reason", ""),
             "reviewed": bool(result.get("reviewed")),
@@ -1641,8 +1649,9 @@ def process_nodeseek_ai_queue(bot):
         bot.remember_seen_id(unique_id)
         bot.save_nodeseek_ai_state()
         bot.save_seen_ids()
+        sub_type_label = f" ({result.get('sub_type')})" if result.get('sub_type') else ""
         print(
-            f"[{datetime.now()}] 🧠 [NodeSeek AI] {decision} "
+            f"[{datetime.now()}] 🧠 [NodeSeek AI] {decision}{sub_type_label} "
             f"({result.get('confidence', 0):.2f}): {record.get('title', '')}",
             flush=True,
         )

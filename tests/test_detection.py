@@ -172,3 +172,29 @@ class SigninParserTest(unittest.TestCase):
             or re.search(r'disabled[^>]*>\s*今日已签到\s*<', html_sample)
         )
         self.assertTrue(already_signed)
+
+    def test_deliver_public_match_welfare_and_lottery_titles(self):
+        bot = main.BotManager.__new__(main.BotManager)
+        bot.total_hit = 0
+        bot.admin_chat_id = "12345"
+        sent_messages = []
+        bot.send_msg = lambda chat_id, msg, disable_preview=False: sent_messages.append(msg) or True
+        bot.record_stat = lambda key: None
+
+        # 1. 验证福利通知
+        main.deliver_public_match(
+            bot, "NodeSeek", "🌐", "日常", "送几个激活码，先到先得", "tester", "描述", "https://nodeseek.com/post-1-1", "welfare", "福利测试"
+        )
+        self.assertIn("🎉 <b>🌐 [NodeSeek] 发现福利新帖！</b>", sent_messages[0])
+
+        # 2. 验证抽奖通知
+        main.deliver_public_match(
+            bot, "NodeSeek", "🌐", "日常", "回帖抽奖送小鸡", "tester", "描述", "https://nodeseek.com/post-2-1", "lottery", "抽奖测试"
+        )
+        self.assertIn("🎁 <b>🌐 [NodeSeek] 发现抽奖新帖！</b>", sent_messages[1])
+
+        # 3. 验证红包通知
+        main.deliver_public_match(
+            bot, "NodeSeek", "🌐", "日常", "发个红包", "tester", "描述", "https://nodeseek.com/post-3-1", "redpacket", "红包测试"
+        )
+        self.assertIn("🧧 <b>🌐 [NodeSeek] 发现红包新帖！</b>", sent_messages[2])

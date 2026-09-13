@@ -9,6 +9,7 @@ from app.ai_classifier import (
     OpenAICompatibleClassifier,
     clean_for_ai,
     decide_extraction,
+    infer_giveaway_subtype,
     normalize_chat_endpoint,
     parse_json_object,
     validate_facts,
@@ -229,3 +230,36 @@ class AIEnvConfigTest(unittest.TestCase):
             finally:
                 main.DATA_DIR = old_data_dir
                 main.SETTINGS_FILE = old_settings_file
+
+    def test_infer_giveaway_subtype_lottery(self):
+        facts_random = {
+            "allocation": "random",
+            "participation": {"method": "reply"},
+        }
+        self.assertEqual("lottery", infer_giveaway_subtype(facts_random, {"title": "回帖抽一台轻量云"}))
+
+    def test_infer_giveaway_subtype_welfare(self):
+        facts_first_come = {
+            "allocation": "first_come",
+            "participation": {"method": "reply"},
+        }
+        self.assertEqual("welfare", infer_giveaway_subtype(facts_first_come, {"title": "送个欧洲小鸡，先到先得"}))
+
+        facts_direct = {
+            "allocation": "direct_gift",
+            "participation": {"method": "direct_claim"},
+        }
+        self.assertEqual("welfare", infer_giveaway_subtype(facts_direct, {"title": "直接送激活码一个"}))
+
+        facts_all = {
+            "allocation": "all",
+            "participation": {"method": "direct_claim"},
+        }
+        self.assertEqual("welfare", infer_giveaway_subtype(facts_all, {"title": "分享个福利兑换码人人有份"}))
+
+    def test_infer_giveaway_subtype_redpacket(self):
+        facts = {
+            "allocation": "first_come",
+            "participation": {"method": "reply"},
+        }
+        self.assertEqual("redpacket", infer_giveaway_subtype(facts, {"title": "发个支付宝口令红包祝大家中秋快乐"}))

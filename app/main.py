@@ -1356,12 +1356,19 @@ def handle_command_or_text(bot, chat_id, text, message_id=None):
             bot.send_msg(chat_id, "▶️ <b>全局监控推送已恢复正常运行！</b>")
 
         elif cmd == "/test":
-            test_msg_ns = (
-                "🎁 <b>🌐 [NodeSeek] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
-                "📌 <b>标题</b>: [日常] 测试抽奖演示贴\n"
+            test_msg_ns_lottery = (
+                "🎁 <b>🌐 [NodeSeek] 发现抽奖新帖！</b> (演示卡片)\n\n"
+                "📌 <b>标题</b>: [日常] 回帖抽奖演示贴（随机抽取 3 台 VPS）\n"
                 "👤 <b>作者</b>: NodeSeeker  |  🏷️ <b>板块</b>: #daily\n"
-                "📝 <b>摘要</b>: 这是一条手动触发的 NodeSeek 测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
+                "📝 <b>摘要</b>: 这是一条手动触发的 NodeSeek 抽奖测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
                 "🔗 <b>链接</b>: https://www.nodeseek.com/post-889000-1"
+            )
+            test_msg_ns_welfare = (
+                "🎉 <b>🌐 [NodeSeek] 发现福利新帖！</b> (演示卡片)\n\n"
+                "📌 <b>标题</b>: [日常] 免费赠送欧洲小鸡/激活码（先到先得）\n"
+                "👤 <b>作者</b>: NodeSeeker  |  🏷️ <b>板块</b>: #daily\n"
+                "📝 <b>摘要</b>: 这是一条手动触发的 NodeSeek 福利/赠送测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
+                "🔗 <b>链接</b>: https://www.nodeseek.com/post-889001-1"
             )
             test_msg_sb = (
                 "🎁 <b>🍪 [烧饼论坛] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
@@ -1377,7 +1384,8 @@ def handle_command_or_text(bot, chat_id, text, message_id=None):
                 "📝 <b>摘要</b>: 命中您的专属关注词 [DMIT]，最高优先级直通推送。\n\n"
                 "🔗 <b>链接</b>: https://www.nodeseek.com/post-999999-1"
             )
-            bot.send_msg(chat_id, test_msg_ns, disable_preview=False)
+            bot.send_msg(chat_id, test_msg_ns_lottery, disable_preview=False)
+            bot.send_msg(chat_id, test_msg_ns_welfare, disable_preview=False)
             bot.send_msg(chat_id, test_msg_sb, disable_preview=False)
             bot.send_msg(chat_id, test_msg_kw, disable_preview=False)
         

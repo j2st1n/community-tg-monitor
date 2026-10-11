@@ -145,6 +145,7 @@ class AIQueueIntegrationTest(unittest.TestCase):
             }
         }
         bot.nodeseek_ai_history = []
+        bot.nodeseek_ai_review = {}
         bot.seen_ids = set()
         bot.seen_id_order = []
         bot.stats = {}
@@ -181,6 +182,81 @@ class AIQueueIntegrationTest(unittest.TestCase):
             self.assertEqual("giveaway", bot.nodeseek_ai_history[0]["decision"])
             self.assertEqual(1, bot.stats.get("ai_giveaway_hits"))
             mock_deliver.assert_called_once()
+
+    def test_failed_post_is_quarantined_at_retry_limit(self):
+        bot = main.BotManager.__new__(main.BotManager)
+        bot.lock = threading.RLock()
+        bot.ai_enabled = True
+        bot.ai_endpoint = "https://api.example.com/v1"
+        bot.ai_model = "test-model"
+        bot.ai_api_key = "sk-test"
+        bot.ai_accept_threshold = 0.90
+        bot.source_states = {"nodeseek": True}
+        bot.nodeseek_ai_pending = {
+            "nodeseek:200": {
+                "id": "nodeseek:200", "title": "未完成的抽奖", "link": "https://example.com/200",
+                "queued_at": 100, "attempts": main.MAX_AI_RETRY_ATTEMPTS - 1,
+                "next_retry_at": 0,
+            }
+        }
+        bot.nodeseek_ai_review = {}
+        bot.seen_ids = set()
+        bot.seen_id_order = []
+        bot.save_nodeseek_ai_state = MagicMock()
+        bot.save_seen_ids = MagicMock()
+        bot.record_stat = MagicMock()
+        classifier = MagicMock()
+        classifier.classify.side_effect = AIClassificationError("missing content")
+        bot.build_ai_classifier = MagicMock(return_value=classifier)
+
+        with patch("app.main.deliver_public_match") as deliver:
+            main.process_nodeseek_ai_queue(bot)
+        self.assertNotIn("nodeseek:200", bot.nodeseek_ai_pending)
+        self.assertIn("nodeseek:200", bot.nodeseek_ai_review)
+        self.assertEqual(main.MAX_AI_RETRY_ATTEMPTS, bot.nodeseek_ai_review["nodeseek:200"]["attempts"])
+        self.assertIn("nodeseek:200", bot.seen_ids)
+        self.assertFalse(bot.queue_nodeseek_post("nodeseek:200", "", "", "", "", ""))
+        bot.save_nodeseek_ai_state.assert_called_once()
+        bot.save_seen_ids.assert_called_once()
+        deliver.assert_not_called()
+
+    def test_previously_exhausted_post_skips_new_ai_request(self):
+        bot = main.BotManager.__new__(main.BotManager)
+        bot.lock = threading.RLock()
+        bot.ai_enabled = True
+        bot.ai_endpoint = "https://api.example.com/v1"
+        bot.ai_model = "test-model"
+        bot.ai_api_key = "sk-test"
+        bot.source_states = {"nodeseek": True}
+        bot.nodeseek_ai_pending = {
+            "nodeseek:old": {"title": "旧帖", "attempts": main.MAX_AI_RETRY_ATTEMPTS, "next_retry_at": 0}
+        }
+        bot.nodeseek_ai_review = {}
+        bot.seen_ids = set()
+        bot.seen_id_order = []
+        bot.save_nodeseek_ai_state = MagicMock()
+        bot.save_seen_ids = MagicMock()
+        bot.record_stat = MagicMock()
+        classifier = MagicMock()
+        bot.build_ai_classifier = MagicMock(return_value=classifier)
+
+        main.process_nodeseek_ai_queue(bot)
+        classifier.classify.assert_not_called()
+        self.assertIn("nodeseek:old", bot.nodeseek_ai_review)
+        self.assertIn("nodeseek:old", bot.seen_ids)
+
+    def test_review_queue_survives_state_reload(self):
+        bot = main.BotManager.__new__(main.BotManager)
+        bot.nodeseek_ai_pending = {}
+        bot.nodeseek_ai_history = []
+        bot.nodeseek_ai_review = {"nodeseek:200": {"attempts": 24, "last_error": "missing content"}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(main, "DATA_DIR", tmpdir), patch.object(
+                main, "NODESEEK_AI_STATE_FILE", os.path.join(tmpdir, "ai-state.json")
+            ):
+                bot.save_nodeseek_ai_state()
+                loaded = bot.load_nodeseek_ai_state()
+        self.assertEqual(bot.nodeseek_ai_review, loaded["review"])
 
 
 if __name__ == "__main__":

@@ -24,6 +24,11 @@ except ModuleNotFoundError:
         AIClassificationError, OpenAICompatibleClassifier, clean_for_ai, normalize_chat_endpoint,
     )
 
+try:
+    from app.participation import ContentPlanner, build_participant
+except ModuleNotFoundError:
+    from participation import ContentPlanner, build_participant
+
 APP_VERSION = "5.1"
 APP_USER_AGENT = f"Community-Monitor-Bot/{APP_VERSION}"
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
@@ -39,9 +44,11 @@ MAX_SEEN_IDS = 10000
 MAX_SEEN_MSGS = 2000
 MAX_SBSB_EVENTS = 5000
 SBSB_RECONCILE_INTERVAL = 300
+SBSB_MARKER_PATHS = (("lottery", "/prize/"), ("redpacket", "/redpacket/"))
 MAX_NODESEEK_AI_PENDING = 500
 MAX_NODESEEK_AI_HISTORY = 2000
 MAX_AI_POSTS_PER_CYCLE = 5
+MAX_AI_RETRY_ATTEMPTS = 24
 
 # 内置多源配置
 DEFAULT_SOURCES = [
@@ -138,6 +145,7 @@ class BotManager:
         ai_state = self.load_nodeseek_ai_state()
         self.nodeseek_ai_pending = ai_state.get("pending", {})
         self.nodeseek_ai_history = ai_state.get("history", [])
+        self.nodeseek_ai_review = ai_state.get("review", {})
         loaded_seen_ids = self.load_seen_ids()
         self.seen_id_order = list(dict.fromkeys(loaded_seen_ids))
         self.seen_ids = set(self.seen_id_order)
@@ -154,6 +162,8 @@ class BotManager:
             kind: set(self.sbsb_event_order[kind])
             for kind in ("lottery", "redpacket")
         }
+        self.participant = build_participant(DATA_DIR, self.sbsb_cookie, self.build_ai_classifier)
+        self.participant.allowed = self.is_sbsb_participation_allowed
         self.register_telegram_commands()
 
     def get_today_cst(self):
@@ -249,6 +259,9 @@ class BotManager:
 
     def load_settings(self):
         os.makedirs(DATA_DIR, exist_ok=True)
+        # Older settings have only notification switches. Preserve the separately
+        # configured participation service, even when notifications are muted.
+        self.sbsb_participation_enabled = True
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -257,6 +270,7 @@ class BotManager:
                     self.keywords = [k for k in raw_keywords if k not in LEGACY_BUILTIN_WORDS]
                     self.poll_interval = data.get("poll_interval", DEFAULT_POLL_INTERVAL)
                     self.paused = data.get("paused", False)
+                    self.sbsb_participation_enabled = bool(data.get("sbsb_participation_enabled", True))
                     self.ai_enabled = bool(data.get("ai_enabled", False))
                     self.ai_endpoint = str(data.get("ai_endpoint", "")).strip()
                     self.ai_model = str(data.get("ai_model", "")).strip()
@@ -302,6 +316,7 @@ class BotManager:
             "poll_interval": self.poll_interval,
             "paused": self.paused,
             "source_states": self.source_states,
+            "sbsb_participation_enabled": self.sbsb_participation_enabled,
             "ai_enabled": self.ai_enabled,
             "ai_endpoint": self.ai_endpoint,
             "ai_model": self.ai_model,
@@ -343,13 +358,15 @@ class BotManager:
                     data = json.load(f)
                 pending = data.get("pending", {})
                 history = data.get("history", [])
+                review = data.get("review", {})
                 return {
                     "pending": pending if isinstance(pending, dict) else {},
                     "history": history if isinstance(history, list) else [],
+                    "review": review if isinstance(review, dict) else {},
                 }
             except Exception as e:
                 print(f"[{datetime.now()}] 读取 NodeSeek AI 状态异常: {e}", flush=True)
-        return {"pending": {}, "history": []}
+        return {"pending": {}, "history": [], "review": {}}
 
     def save_nodeseek_ai_state(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -361,14 +378,15 @@ class BotManager:
             self.nodeseek_ai_history = self.nodeseek_ai_history[-MAX_NODESEEK_AI_HISTORY:]
         with open(NODESEEK_AI_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(
-                {"pending": self.nodeseek_ai_pending, "history": self.nodeseek_ai_history},
+                {"pending": self.nodeseek_ai_pending, "history": self.nodeseek_ai_history,
+                 "review": self.nodeseek_ai_review},
                 f,
                 ensure_ascii=False,
                 indent=2,
             )
 
     def queue_nodeseek_post(self, unique_id, category, title, author, desc, link):
-        if unique_id in self.nodeseek_ai_pending:
+        if unique_id in self.nodeseek_ai_pending or unique_id in self.nodeseek_ai_review:
             return False
         self.nodeseek_ai_pending[unique_id] = {
             "id": unique_id,
@@ -432,6 +450,7 @@ class BotManager:
             f"• API Key: <code>{html.escape(self.masked_ai_key())}</code>",
             f"• 自动通过阈值: <code>{self.ai_accept_threshold:.2f}</code>",
             f"• 待判定队列: <b>{len(self.nodeseek_ai_pending)}</b> 篇",
+            f"• 待人工复核: <b>{len(self.nodeseek_ai_review)}</b> 篇",
             "",
             "<i>💡 最佳实践：直接在服务器 .env 中配置 <code>AI_API_KEY</code> 等变量，安全且无需在对话框输入任何密钥。</i>"
         ]
@@ -477,6 +496,32 @@ class BotManager:
             self.source_states[source_id] = not current
             self.save_settings()
             return self.source_states[source_id]
+
+    def is_sbsb_participation_allowed(self):
+        with self.lock:
+            participant = getattr(self, "participant", None)
+            return bool(participant and participant.enabled and
+                        self.sbsb_participation_enabled and not self.paused)
+
+    def toggle_sbsb_participation(self):
+        with self.lock:
+            self.sbsb_participation_enabled = not self.sbsb_participation_enabled
+            self.save_settings()
+            return self.sbsb_participation_enabled
+
+    def run_sbsb_participation(self, topics):
+        return self.participant.run(topics, paused=not self.is_sbsb_participation_allowed())
+
+    def sbsb_participation_status(self):
+        with self.lock:
+            participant = getattr(self, "participant", None)
+            if not participant or not participant.enabled:
+                return "⚪ 服务未启用"
+            if not self.sbsb_participation_enabled:
+                return "🔴 已关闭"
+            if self.paused:
+                return "⏸️ 全局暂停中"
+            return "🟢 已开启"
 
     def match_custom_keyword(self, title, desc):
         """匹配用户专属关注词（最高优先级直通）"""
@@ -673,7 +718,7 @@ class BotManager:
         if not self.sbsb_cookie:
             sb_checkin_info = "官方标记 (未配置 Cookie 签到)"
 
-        pause_label = "▶️ 恢复推送" if self.paused else "⏸️ 暂停推送"
+        pause_label = "▶️ 恢复推送与参与" if self.paused else "⏸️ 暂停推送与参与"
         pause_action = "resume" if self.paused else "pause"
 
         kw_status = f"<b>{len(self.keywords)}</b> 个 (最高优先级直通)" if self.keywords else "未配置 (默认不启用)"
@@ -690,8 +735,9 @@ class BotManager:
             f"📡 <b>轮询频率</b>: 每 {self.poll_interval} 秒扫描双源",
             "",
             "🌐 <b>监控网站状态</b>",
-            f"• 🌐 <b>NodeSeek</b>: {ns_on} ({ai_status} AI 判定，待处理 {len(self.nodeseek_ai_pending)} 篇)",
+            f"• 🌐 <b>NodeSeek</b>: {ns_on} ({ai_status} AI 判定，待处理 {len(self.nodeseek_ai_pending)} 篇 / 待复核 {len(self.nodeseek_ai_review)} 篇)",
             f"• 🍪 <b>烧饼论坛</b>: {sb_on} ({sb_checkin_info})",
+            f"• 🍪 <b>红包/抽奖自动参与</b>: {self.sbsb_participation_status()}",
             "",
             "🎯 <b>专属关注雷达</b>",
             f"• 状态: {kw_status}",
@@ -700,6 +746,9 @@ class BotManager:
             f"• 扫描新帖: <b>{scanned}</b> 篇  |  今日累计命中: <b>{hits}</b> 篇",
             f"• 烧饼私信提醒: <b>{priv_notified}</b> 次  |  去重索引库: <b>{len(self.seen_ids)}</b> 篇公开帖",
         ]
+        participant = getattr(self, "participant", None)
+        if participant:
+            lines.append(f"• 自动参与预算: {html.escape(participant.summary())}")
         text = "\n".join(lines)
         markup = {
             "inline_keyboard": [
@@ -751,14 +800,19 @@ class BotManager:
                 is_on = self.source_states.get(sid, True)
                 status_str = "🟢 开启推送中" if is_on else "🔴 已暂停推送"
                 lines.append(f"{sicon} <b>{sname}</b>: {status_str}")
-                btn_text = f"{sicon} {sname}: {'开启 🟢' if is_on else '关闭 🔴'}"
+                btn_text = f"{sicon} {sname}推送: {'开启 🟢' if is_on else '关闭 🔴'}"
                 buttons.append([{"text": btn_text, "callback_data": f"toggle_src:{sid}"}])
+
+            if any(s["id"] == "sbsb" for s in self.sources):
+                lines.append(f"🍪 <b>红包/抽奖自动参与</b>: {self.sbsb_participation_status()}")
+                buttons.append([{"text": f"🍪 自动参与: {self.sbsb_participation_status()}",
+                                 "callback_data": "toggle_participation:sbsb"}])
 
         body = "\n".join(lines)
         text = (
             "📡 <b>监控网站独立推送开关控制台</b>\n\n"
             f"{body}\n\n"
-            "<i>💡 点击下方按钮可独立开启/关闭对应网站的抽奖与新帖推送：</i>"
+            "<i>💡 网站推送与自动参与分别控制。关闭烧饼推送仍可自动参与红包/抽奖；全局暂停会停止两者。每日签到保持原设置。</i>"
         )
         markup = {"inline_keyboard": buttons}
         return text, markup
@@ -809,14 +863,34 @@ class BotManager:
             "🌐 <b>【NodeSeek】AI 语义驱动</b>",
             f"• 📡 监控状态: {ns_is_on} (全站实时流)",
             f"• 🧠 AI 判定总数: <b>{ai_classified}</b> 篇 (API 请求 {ai_requests} 次 / 异常 {ai_errors})",
+            f"• 待人工复核: <b>{len(self.nodeseek_ai_review)}</b> 篇",
             f"• 🎯 判定结果分布: 抽奖命中 <b>{ai_giveaway_hits}</b> 篇 | 边界二审 <b>{ai_second_reviews}</b> 篇 | 存疑待审 <b>{ai_uncertain}</b> 篇",
+            "• 🤖 自动回帖参与: ⚪ 未启用",
             "",
             "🍪 <b>【烧饼论坛】官方标记与签到</b>",
-            f"• 📡 监控状态: {sb_is_on} (RSS 30s + 官方标记 5m)",
+            f"• 📡 活动推送: {sb_is_on} (RSS 30s + 官方标记 5m)",
             f"• 🎁 官方标记事件: 抽奖 <b>{sbsb_lottery_events}</b> 篇 | 红包 <b>{sbsb_redpacket_events}</b> 个 (巡检 {marker_poll_success} 次 / 异常 {marker_poll_errors})",
             f"• 📬 私信与互动通知: <b>{priv_notified}</b> 次提醒",
             f"• 🍪 每日自动签到: {sb_checkin_str}",
         ]
+        lines.extend(["", "🤖 <b>【烧饼】红包与抽奖自动参与</b>",
+                      f"• 参与开关: {self.sbsb_participation_status()} (独立于活动推送)"])
+        if isinstance(self.participant.planner, ContentPlanner) and not self.participant.planner.key:
+            lines.append("• ⚠️ 安全筛查未配置，当前无法自动参与")
+        try:
+            participation = self.participant.ledger.daily_report(date_str)
+        except Exception:
+            lines.append("• ⚠️ 参与账本读取异常，统计暂不可用")
+        else:
+            for kind, label in (("redpacket", "红包"), ("lottery", "抽奖")):
+                counts = participation["groups"][kind]
+                lines.append(f"• 🎁 {label}: 自动提交确认 <b>{counts['submitted']}</b> 项 | 账号已参与 <b>{counts['account_joined']}</b> 项 | 结果待确认 <b>{counts['unconfirmed']}</b> 项")
+                lines.append(f"  跳过 {counts['skipped']} / 需人工处理 {counts['review']} / 待重试 {counts['retry']}")
+            lines.extend([
+                f"• ⏳ 当前随机等待: <b>{participation['waiting']}</b> 项",
+                f"• 🍪 当日保守预算占用: <b>{participation['reserved_cost']}/{self.participant.daily}</b> 饼 | 提交预留 <b>{participation['reserved_count']}/{self.participant.max_daily}</b> 次",
+                "• 口径: 当日账本按活动去重；账号已参与不归因于自动提交；参与不代表中奖或到账；预算占用并非实际扣饼。",
+            ])
         return "\n".join(lines)
 
 
@@ -1083,11 +1157,21 @@ def handle_callback_query(bot, query):
         text, markup = bot.format_sources_card()
         bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
 
+    elif data == "toggle_participation:sbsb":
+        if not bot.participant.enabled:
+            bot.answer_callback_query(query_id, "自动参与服务尚未启用")
+            return
+        new_state = bot.toggle_sbsb_participation()
+        note = "（全局暂停中，恢复后生效）" if new_state and bot.paused else ""
+        bot.answer_callback_query(query_id, f"自动参与已{'开启' if new_state else '关闭'}{note}")
+        text, markup = bot.format_sources_card()
+        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
+
     elif data == "menu:pause":
         with bot.lock:
             bot.paused = True
             bot.save_settings()
-        bot.answer_callback_query(query_id, "⏸️ 已暂停全局推送")
+        bot.answer_callback_query(query_id, "⏸️ 已暂停推送和活动参与")
         text, markup = bot.format_status_card()
         bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
 
@@ -1095,7 +1179,7 @@ def handle_callback_query(bot, query):
         with bot.lock:
             bot.paused = False
             bot.save_settings()
-        bot.answer_callback_query(query_id, "▶️ 已恢复全局推送")
+        bot.answer_callback_query(query_id, "▶️ 已恢复推送和活动参与")
         text, markup = bot.format_status_card()
         bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
 
@@ -1439,13 +1523,13 @@ def handle_command_or_text(bot, chat_id, text, message_id=None):
             with bot.lock:
                 bot.paused = True
                 bot.save_settings()
-            bot.send_msg(chat_id, "⏸️ <b>全局监控推送已暂停！</b>\n（后台继续记录去重索引，免打扰，发送 /resume 可随时恢复）")
+            bot.send_msg(chat_id, "⏸️ <b>推送和红包/抽奖自动参与已暂停。</b>\n后台继续记录通知去重索引；每日签到保持原设置。发送 /resume 恢复。")
 
         elif cmd == "/resume":
             with bot.lock:
                 bot.paused = False
                 bot.save_settings()
-            bot.send_msg(chat_id, "▶️ <b>全局监控推送已恢复正常运行！</b>")
+            bot.send_msg(chat_id, "▶️ <b>推送和红包/抽奖自动参与已恢复。</b>")
 
         elif cmd == "/test":
             test_msg_ns_lottery = (
@@ -1657,8 +1741,30 @@ def deliver_public_match(bot, source_name, source_icon, category, title, author,
     return delivered
 
 
+def quarantine_nodeseek_ai_failure(bot, unique_id, record, now_ts):
+    """Keep exhausted posts for review without retrying or silently accepting them."""
+    bot.nodeseek_ai_review[unique_id] = {
+        "id": unique_id,
+        "title": record.get("title", ""),
+        "link": record.get("link", ""),
+        "queued_at": record.get("queued_at"),
+        "attempts": record.get("attempts", 0),
+        "last_error": record.get("last_error", ""),
+        "quarantined_at": now_ts,
+    }
+    bot.nodeseek_ai_pending.pop(unique_id, None)
+    bot.remember_seen_id(unique_id)
+    bot.save_nodeseek_ai_state()
+    bot.save_seen_ids()
+    print(
+        f"[{datetime.now()}] ⚠️ NodeSeek AI 连续判定失败，转待人工复核: "
+        f"{record.get('title', '')} ({record.get('attempts', 0)} 次)",
+        flush=True,
+    )
+
+
 def process_nodeseek_ai_queue(bot):
-    """Classify queued NodeSeek posts; API failures remain pending for retry."""
+    """Classify queued NodeSeek posts and quarantine exhausted retries."""
     if not bot.ai_is_ready() or not bot.is_source_enabled("nodeseek"):
         return
     try:
@@ -1672,6 +1778,9 @@ def process_nodeseek_ai_queue(bot):
     for unique_id, record in list(bot.nodeseek_ai_pending.items()):
         if processed >= MAX_AI_POSTS_PER_CYCLE:
             break
+        if int(record.get("attempts", 0)) >= MAX_AI_RETRY_ATTEMPTS:
+            quarantine_nodeseek_ai_failure(bot, unique_id, record, now_ts)
+            continue
         if int(record.get("next_retry_at", 0)) > now_ts:
             continue
         processed += 1
@@ -1688,11 +1797,14 @@ def process_nodeseek_ai_queue(bot):
             result = classifier.classify(post, accept_threshold=bot.ai_accept_threshold)
         except (AIClassificationError, ValueError) as exc:
             attempts = int(record.get("attempts", 0)) + 1
-            retry_seconds = min(1800, 60 * (2 ** min(attempts - 1, 5)))
             record["attempts"] = attempts
-            record["next_retry_at"] = now_ts + retry_seconds
             record["last_error"] = clean_for_ai(str(exc), 180)
             bot.record_stat("ai_errors")
+            if attempts >= MAX_AI_RETRY_ATTEMPTS:
+                quarantine_nodeseek_ai_failure(bot, unique_id, record, now_ts)
+                continue
+            retry_seconds = min(1800, 60 * (2 ** min(attempts - 1, 5)))
+            record["next_retry_at"] = now_ts + retry_seconds
             bot.save_nodeseek_ai_state()
             print(
                 f"[{datetime.now()}] ⚠️ NodeSeek AI 判定失败，{retry_seconds}s 后重试: "
@@ -2292,7 +2404,7 @@ def rss_monitor_thread(bot):
                 reconcile_complete = False
                 if now_monotonic - last_sbsb_reconcile >= SBSB_RECONCILE_INTERVAL:
                     reconcile_pages = {}
-                    for badge_kind, path in (("lottery", "/lottery/"), ("redpacket", "/redpacket/")):
+                    for badge_kind, path in SBSB_MARKER_PATHS:
                         page_html = fetch_sbsb_topic_page(path, bot.sbsb_cookie)
                         if page_html is None:
                             bot.record_stat("marker_poll_errors")
@@ -2304,6 +2416,13 @@ def rss_monitor_thread(bot):
                     last_sbsb_reconcile = now_monotonic
 
                 sbsb_enabled = bot.is_source_enabled("sbsb")
+                participant = getattr(bot, "participant", None)
+                participation_results = {}
+                if participant:
+                    candidates = {topic["link"]: topic for batch in marker_batches for topic in batch}
+                    participation_results = bot.run_sbsb_participation(list(candidates.values()))
+                    for link, stage in participation_results.items():
+                        print(f"[{datetime.now()}] 🍪 自动参与阶段: {stage} ({link})", flush=True)
                 may_notify = bot.sbsb_events_initialized
                 for topics in marker_batches:
                     for topic in reversed(topics):
@@ -2319,6 +2438,17 @@ def rss_monitor_thread(bot):
                         bot.record_stat(f"sbsb_{badge_kind}_events")
                         if not bot.paused and sbsb_enabled:
                             label = "抽奖" if badge_kind == "lottery" else "红包"
+                            stage = participation_results.get(topic["link"])
+                            participation_text = {
+                                "waiting": "已安排随机等待，轮到时会复查活动状态再参与。",
+                                "confirmed": "本程序提交后已核验本账号参与成功。",
+                                "query_confirmed": "已查到本账号参与，提交结果不明确，未归因为本程序。",
+                                "uncertain": "参与结果未确认，已保留预算且停止重复提交，请查看原帖。",
+                                "manual_requirements": "含审核或附加要求，仅提醒，请自行确认。",
+                                "daily_budget": "今日参与预算已满，仅提醒。",
+                                "already": "本账号已经参与，无需重复操作。",
+                                "ended": "活动已结束，无需参与。",
+                            }.get(stage, "")
                             deliver_public_match(
                                 bot,
                                 "烧饼论坛",
@@ -2326,7 +2456,7 @@ def rss_monitor_thread(bot):
                                 topic["category"],
                                 topic["title"],
                                 topic["author"],
-                                f"论坛主题列表已显示官方{label}标记，正文可能仅登录用户可见。",
+                                f"论坛主题列表已显示官方{label}标记，正文可能仅登录用户可见。{participation_text}",
                                 topic["link"],
                                 badge_kind,
                                 f"命中烧饼论坛官方{label}标记",

@@ -2,6 +2,8 @@
 .env.bak-*
 backups/
 data/*.json
+data/participation_typesafe.key
+data/sbsb_participation.json.lock
 *.log
 __pycache__/
 .DS_Store

@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.browser
-    image: community-monitor:browser-20261011-confirmation
+    image: community-monitor:participation-controls-20261011
     init: true
     shm_size: 256mb
     environment:

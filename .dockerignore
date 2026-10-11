@@ -1,5 +1,7 @@
 .git
 .env
+.env.bak-*
+backups/
 data/
 *.log
 __pycache__

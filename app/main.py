@@ -10,6 +10,8 @@ import traceback
 import threading
 import urllib.request
 import urllib.parse
+import urllib.error
+from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
@@ -832,92 +834,167 @@ def make_keyword_buttons(keywords, prefix="del_kw"):
     return {"inline_keyboard": buttons}
 
 
-def do_sbsb_signin(cookie):
-    """执行烧饼论坛自动签到并精确解析资产、成长值、连续天数与官方签到时间"""
+SBSB_CHECKIN_URL = "https://sb.sb/checkin/"
+
+
+class SbsbSigninPageParser(HTMLParser):
+    """Read the official form and counters without borrowing another form's CSRF."""
+
+    def __init__(self, page_html):
+        super().__init__(convert_charrefs=True)
+        self.form = None
+        self.forms = []
+        self.button = None
+        self.capture = None
+        self.streak = None
+        self.total = None
+        self.stat_value = None
+        self.signed = False
+        self.has_captcha = False
+        self.cap_endpoint = None
+        self.feed(page_html)
+        checkin = self.checkin_form()
+        self.cap_endpoint = checkin.get("cap_endpoint") if checkin else None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = attrs.get("class", "").split()
+        if tag == "form":
+            action = urllib.parse.urljoin(SBSB_CHECKIN_URL, attrs.get("action", ""))
+            self.form = {"action": action, "csrf": None, "cap_endpoint": None}
+        elif tag == "input" and self.form is not None and attrs.get("name") == "_csrf":
+            self.form["csrf"] = attrs.get("value")
+        elif tag == "button":
+            self.button = {"disabled": "disabled" in attrs, "text": "", "classes": classes}
+        elif tag == "cap-widget":
+            self.has_captcha = True
+            if self.form is not None:
+                self.form["cap_endpoint"] = attrs.get("data-cap-api-endpoint")
+        for field in ("signin-streak-num", "signin-stat-value", "signin-stat-label"):
+            if field in classes:
+                self.capture = {"tag": tag, "field": field, "text": ""}
+                break
+
+    def handle_data(self, data):
+        if self.button is not None:
+            self.button["text"] += data
+        if self.capture is not None:
+            self.capture["text"] += data
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self.form is not None:
+            self.forms.append(self.form)
+            self.form = None
+        if tag == "button" and self.button is not None:
+            if (self.button["disabled"] and "btn-post" in self.button["classes"]
+                    and self.button["text"].strip() == "今日已签到"):
+                self.signed = True
+            self.button = None
+        if self.capture is not None and tag == self.capture["tag"]:
+            value = self.capture["text"].strip()
+            field = self.capture["field"]
+            if field == "signin-streak-num":
+                self.streak = int(value) if re.fullmatch(r"\d+", value) else None
+            elif field == "signin-stat-value":
+                self.stat_value = int(value) if re.fullmatch(r"\d+", value) else None
+            elif value == "累计签到":
+                self.total = self.stat_value
+            self.capture = None
+
+    def checkin_form(self):
+        return next((form for form in self.forms if form["action"] == SBSB_CHECKIN_URL), None)
+
+
+def run_sbsb_browser_checkin(cookie, cap_endpoint):
+    try:
+        from app.browser_signin import run_checkin
+    except ModuleNotFoundError:
+        from browser_signin import run_checkin
+    return run_checkin(cookie, cap_endpoint=cap_endpoint)
+
+
+def do_sbsb_signin(cookie, allow_submit=True):
+    """Sign in through the current official form; only confirmed state is success."""
     if not cookie:
         return {"success": False, "msg": "未配置 SBSB_COOKIE，请先在 VPS 配置 Cookie"}
-
     if "=" not in cookie:
         cookie = f"__Host-bbs_session={cookie}"
-
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "User-Agent": APP_USER_AGENT,
         "Cookie": cookie,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://sb.sb/",
+        "Accept": "text/html,application/xhtml+xml",
+        "Referer": SBSB_CHECKIN_URL,
         "Origin": "https://sb.sb",
+        "Cache-Control": "no-cache",
     }
 
     class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-        def http_error_302(self, req, fp, code, msg, headers):
-            return fp
-        def http_error_303(self, req, fp, code, msg, headers):
-            return fp
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
 
     opener = urllib.request.build_opener(NoRedirectHandler)
 
+    def read_response(req):
+        try:
+            resp = opener.open(req, timeout=15)
+        except urllib.error.HTTPError as exc:
+            resp = exc
+        with resp:
+            status = getattr(resp, "status", getattr(resp, "code", 200))
+            location = resp.headers.get("Location", "")
+            body = resp.read().decode("utf-8", errors="replace")
+        if location:
+            target = urllib.parse.urljoin(SBSB_CHECKIN_URL, location)
+            if target != SBSB_CHECKIN_URL:
+                raise ValueError("签到请求跳转到登录页或非签到地址，请检查 Cookie")
+        return status, body
+
     try:
-        req = urllib.request.Request("https://sb.sb/signin/", headers=headers)
-        resp = opener.open(req, timeout=15)
-        status_code = getattr(resp, "status", getattr(resp, "code", 200))
-        location = resp.headers.get("Location", "")
-        if status_code in [302, 303] and ("login" in location or "/login" in location):
-            return {"success": False, "msg": "Cookie 已失效，请在 VPS 重新填入 SBSB_COOKIE"}
+        status, html_signin = read_response(urllib.request.Request(SBSB_CHECKIN_URL, headers=headers))
+        if status != 200:
+            return {"success": False, "msg": f"访问官方签到页面失败 (HTTP {status})"}
+        page = SbsbSigninPageParser(html_signin)
+        already_signed = page.signed
+        if not already_signed:
+            if not allow_submit:
+                return {"success": False, "needs_human": True,
+                        "msg": "等待浏览器完成人机验证与签到；本次仅查询状态"}
+            form = page.checkin_form()
+            if not form or not form["csrf"]:
+                return {"success": False, "msg": "未找到官方签到表单或 CSRF，可能需要重新登录"}
+            if os.environ.get("SBSB_BROWSER_SIGNIN", "").lower() in ("1", "true", "yes"):
+                browser_result = run_sbsb_browser_checkin(cookie, page.cap_endpoint)
+                print(f"[{datetime.now()}] 🍪 浏览器签到阶段: {browser_result.get('browser_stage', 'unknown')}", flush=True)
+                if not browser_result.get("success"):
+                    return browser_result
+                already_signed = browser_result.get("already", False)
+            else:
+                post_headers = dict(headers)
+                post_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                post_data = urllib.parse.urlencode({"_csrf": form["csrf"], "message": ""}).encode("utf-8")
+                post_status, _ = read_response(urllib.request.Request(
+                    SBSB_CHECKIN_URL, data=post_data, headers=post_headers,
+                ))
+                if post_status not in (200, 302, 303):
+                    reason = "；页面包含人机验证，请在浏览器完成签到" if page.has_captcha else ""
+                    return {"success": False, "needs_human": page.has_captcha,
+                            "msg": f"官方签到提交未成功 (HTTP {post_status}){reason}"}
+            status, html_signin = read_response(urllib.request.Request(SBSB_CHECKIN_URL, headers=headers))
+            page = SbsbSigninPageParser(html_signin)
+            if status != 200 or not page.signed:
+                reason = "页面要求人机验证，请在浏览器完成签到" if page.has_captcha else "官方页面仍未确认今日已签到"
+                return {"success": False, "needs_human": page.has_captcha, "msg": reason}
+    except Exception as exc:
+        # Do not expose request headers, form tokens or raw HTML in Telegram.
+        return {"success": False, "msg": f"访问官方签到页面异常 ({type(exc).__name__})"}
 
-        html_signin = resp.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        return {"success": False, "msg": f"访问签到页面异常: {e}"}
-
-    # 精确判断签到状态（结构化匹配按钮或表单）
-    already_signed = bool(
-        re.search(r'<button[^>]*class=["\'][^"\']*btn-post[^"\']*["\'][^>]*disabled[^>]*>\s*今日已签到\s*</button>', html_signin, re.IGNORECASE)
-        or re.search(r'disabled[^>]*>\s*今日已签到\s*<', html_signin)
-    )
-
-    flash_msg = ""
-    # 如果未签到，寻找 signin 表单并发起 POST 签到
-    if not already_signed:
-        signin_form_m = re.search(r'<form[^>]*action=["\'](?:https://sb\.sb)?/signin/?["\'][^>]*>(.*?)</form>', html_signin, re.DOTALL | re.IGNORECASE)
-        form_body = signin_form_m.group(1) if signin_form_m else html_signin
-        csrf_match = (
-            re.search(r'name=["\']_csrf["\']\s+value=["\']([^"\']+)["\']', form_body)
-            or re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_csrf["\']', form_body)
-            or re.search(r'name=["\']_csrf["\']\s+value=["\']([^"\']+)["\']', html_signin)
-        )
-        if csrf_match:
-            csrf_token = csrf_match.group(1)
-            post_data = urllib.parse.urlencode({"_csrf": csrf_token}).encode("utf-8")
-            post_headers = dict(headers)
-            post_headers["Content-Type"] = "application/x-www-form-urlencoded"
-            post_headers["Referer"] = "https://sb.sb/signin/"
-            post_headers["Origin"] = "https://sb.sb"
-            try:
-                post_req = urllib.request.Request("https://sb.sb/signin/", data=post_data, headers=post_headers)
-                opener.open(post_req, timeout=15)
-                # 签到 POST 成功后重新拉取 /signin/ 页面以获取更新后的连签天数与提示
-                req_refreshed = urllib.request.Request("https://sb.sb/signin/", headers=headers)
-                with opener.open(req_refreshed, timeout=15) as resp_refreshed:
-                    html_signin = resp_refreshed.read().decode("utf-8", errors="ignore")
-                already_signed = True
-            except Exception as e:
-                print(f"[{datetime.now()}] 提交签到请求异常: {e}", flush=True)
-
-    # 提取 flash 消息
-    flash_match = re.search(r'window\.__pageFlash=["\']([^"\']*)["\']', html_signin) or re.search(r'class=["\'][^"\']*toast[^"\']*["\']>([^<]+)<', html_signin)
-    if flash_match and flash_match.group(1).strip():
-        flash_msg = flash_match.group(1).strip()
-    else:
-        flash_msg = "今日已完成签到" if already_signed else "签到成功"
-
-    streak_m = re.search(r'class=\"[^\"]*signin-streak-num[^\"]*\"[^>]*>(\d+)</div>', html_signin)
-    streak_days = streak_m.group(1) if streak_m else "1"
-
-    total_days_m = re.search(r'<span[^>]*class=\"signin-stat-value\">(\d+)</span>\s*<span[^>]*class=\"signin-stat-label\">累计签到', html_signin)
-    total_days = total_days_m.group(1) if total_days_m else streak_days
-
-    points = "0"
-    exp = "0"
-    level = "会员"
+    # Missing/zero counters after a confirmed sign-in are not fabricated as 0 or 1.
+    streak_days = f"{page.streak} 天" if page.streak is not None and page.streak > 0 else "暂未获取"
+    total_days = f"{page.total} 天" if page.total is not None and page.total > 0 else "暂未获取"
+    flash_msg = "今日已完成签到" if already_signed else "签到成功"
+    points = "暂未获取"
+    exp = "暂未获取"
+    level = "暂未获取"
     signin_time_str = ""
 
     try:
@@ -927,7 +1004,7 @@ def do_sbsb_signin(cookie):
 
         pts_match = re.search(r'可用烧饼</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>(\d+)</span>', html_points) or re.search(r'可用烧饼.*?(\d+)', html_points)
         if pts_match:
-            points = pts_match.group(1)
+            points = f"{pts_match.group(1)} 饼"
 
         exp_match = re.search(r'成长值</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>(\d+)</span>', html_points) or re.search(r'成长值.*?(\d+)', html_points)
         if exp_match:
@@ -954,17 +1031,18 @@ def do_sbsb_signin(cookie):
     except Exception as pe:
         print(f"[{datetime.now()}] 访问 points 页面异常: {pe}", flush=True)
 
-    if not signin_time_str:
-        tz_cst = timezone(timedelta(hours=8))
-        signin_time_str = datetime.now(tz_cst).strftime('%Y-%m-%d %H:%M:%S')
+    # A past ledger entry must not be presented as today's confirmed sign-in time.
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    if not signin_time_str.startswith(today):
+        signin_time_str = "暂未获取"
 
     return {
         "success": True,
-        "already": already_signed or ("已签到" in flash_msg),
+        "already": already_signed,
         "msg": flash_msg,
-        "consecutive_days": f"{streak_days} 天",
-        "total_days": f"{total_days} 天",
-        "total_points": f"{points} 饼",
+        "consecutive_days": streak_days,
+        "total_days": total_days,
+        "total_points": points,
         "exp": exp,
         "level": level,
         "signin_time": signin_time_str
@@ -1665,6 +1743,11 @@ def process_nodeseek_ai_queue(bot):
         )
 
 
+def sbsb_checkin_due(now_cst, last_date):
+    return (last_date != now_cst.strftime("%Y-%m-%d")
+            and (now_cst.hour, now_cst.minute) >= (8, 5))
+
+
 def sbsb_checkin_scheduler_thread(bot):
     """烧饼论坛每日自动签到调度线程 (北京时间每天 08:05 执行)"""
     if not bot.sbsb_cookie:
@@ -1672,47 +1755,64 @@ def sbsb_checkin_scheduler_thread(bot):
 
     print(f"[{datetime.now()}] ⏰ 烧饼论坛每日自动签到调度器已就绪 (目标时间: 北京时间 08:05)...", flush=True)
 
-    def get_last_checkin_date():
+    def get_checkin_state():
         if os.path.exists(CHECKIN_STATE_FILE):
             try:
                 with open(CHECKIN_STATE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f).get("last_date", "")
+                    state = json.load(f)
+                    return state if isinstance(state, dict) else {}
             except Exception:
-                return ""
-        return ""
+                return {}
+        return {}
 
-    def save_last_checkin_date(d_str):
+    def save_checkin_state(state):
         os.makedirs(DATA_DIR, exist_ok=True)
-        with open(CHECKIN_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"last_date": d_str}, f, ensure_ascii=False)
+        temp_path = CHECKIN_STATE_FILE + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(temp_path, CHECKIN_STATE_FILE)
 
     while True:
         try:
             tz_cst = timezone(timedelta(hours=8))
             now_cst = datetime.now(tz_cst)
             today_str = now_cst.strftime("%Y-%m-%d")
-            last_date = get_last_checkin_date()
+            state = get_checkin_state()
+            last_date = state.get("last_date", "")
 
-            if last_date != today_str:
-                if now_cst.hour >= 8 or last_date == "":
-                    print(f"[{datetime.now()}] 🎯 触发烧饼论坛每日自动签到流水线...", flush=True)
-                    res = do_sbsb_signin(bot.sbsb_cookie)
-                    if res.get("success"):
-                        save_last_checkin_date(today_str)
-                        status_badge = "✅ 自动签到成功！" if not res.get("already") else "✨ 今日已自动完成签到"
-                        report_msg = (
-                            f"🍪 <b>烧饼论坛 (sb.sb) 每日自动签到报告</b>\n\n"
-                            f"🎉 <b>签到状态</b>: {status_badge}\n"
-                            f"📅 <b>连续签到</b>: <b>{res.get('consecutive_days')}</b> (累计: {res.get('total_days')})\n"
-                            f"💰 <b>可用烧饼</b>: <b>{res.get('total_points')}</b>\n"
-                            f"⭐ <b>成长等级</b>: <b>{res.get('level')}</b> (成长值: {res.get('exp')})\n"
-                            f"🕒 <b>签到时间</b>: {res.get('signin_time')}\n\n"
-                            "<i>💡 每日 08:05 (UTC+8) 定时自动执行</i>"
+            if sbsb_checkin_due(now_cst, last_date):
+                print(f"[{datetime.now()}] 🎯 触发烧饼论坛每日自动签到流水线...", flush=True)
+                res = do_sbsb_signin(
+                    bot.sbsb_cookie, allow_submit=state.get("manual_required_date") != today_str,
+                )
+                if res.get("success"):
+                    save_checkin_state({"last_date": today_str})
+                    status_badge = "✅ 自动签到成功！" if not res.get("already") else "✨ 今日已签到（查询确认）"
+                    report_msg = (
+                        f"🍪 <b>烧饼论坛 (sb.sb) 每日自动签到报告</b>\n\n"
+                        f"🎉 <b>签到状态</b>: {status_badge}\n"
+                        f"📅 <b>连续签到</b>: <b>{res.get('consecutive_days')}</b> (累计: {res.get('total_days')})\n"
+                        f"💰 <b>可用烧饼</b>: <b>{res.get('total_points')}</b>\n"
+                        f"⭐ <b>成长等级</b>: <b>{res.get('level')}</b> (成长值: {res.get('exp')})\n"
+                        f"🕒 <b>签到时间</b>: {res.get('signin_time')}\n\n"
+                        "<i>💡 每日 08:05 (UTC+8) 定时自动执行</i>"
+                    )
+                    bot.send_msg(bot.admin_chat_id, report_msg)
+                    outcome = "提交成功" if not res.get("already") else "查询确认"
+                    print(f"[{datetime.now()}] ✅ 烧饼签到 {outcome}，通知调用完成（连续: {res.get('consecutive_days')}，累计: {res.get('total_days')}）。", flush=True)
+                else:
+                    print(f"[{datetime.now()}] ⚠️ 自动签到未能成功: {res.get('msg')}", flush=True)
+                    if res.get("needs_human"):
+                        state["manual_required_date"] = today_str
+                    if state.get("last_error_date") != today_str:
+                        reason = html.escape(str(res.get("msg", "未确认签到成功")))
+                        bot.send_msg(
+                            bot.admin_chat_id,
+                            f"⚠️ <b>烧饼论坛自动签到未完成</b>\n原因: <code>{reason}</code>\n"
+                            "<i>未记录为签到成功；如需人机验证，请在浏览器完成签到。</i>",
                         )
-                        bot.send_msg(bot.admin_chat_id, report_msg)
-                        print(f"[{datetime.now()}] ✅ 烧饼论坛每日自动签到执行完毕并推送通知！", flush=True)
-                    else:
-                        print(f"[{datetime.now()}] ⚠️ 自动签到未能成功: {res.get('msg')}", flush=True)
+                        state["last_error_date"] = today_str
+                    save_checkin_state(state)
 
         except Exception as e:
             print(f"[{datetime.now()}] 签到调度器异常: {e}", flush=True)

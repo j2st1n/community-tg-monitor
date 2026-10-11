@@ -1,0 +1,7 @@
+FROM mcr.microsoft.com/playwright/python:v1.63.0-noble
+
+RUN pip install --no-cache-dir playwright==1.63.0
+WORKDIR /app
+COPY app /app/app
+ENV DATA_DIR=/app/data PYTHONUNBUFFERED=1 TZ=Asia/Shanghai SBSB_BROWSER_SIGNIN=1
+CMD ["python3", "/app/app/main.py"]

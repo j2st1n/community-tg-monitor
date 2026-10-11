@@ -1,0 +1,11 @@
+services:
+  community-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    image: community-monitor:browser-20261011-desktop
+    init: true
+    shm_size: 256mb
+    environment:
+      SBSB_BROWSER_SIGNIN: "1"
+      SBSB_BROWSER_MODE: "desktop"

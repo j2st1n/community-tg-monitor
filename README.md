@@ -1,6 +1,6 @@
 # 🎁 Community TG Monitor (多社区抽奖与热帖监控 Bot)
 
-> 纯轻量、零外部依赖、官方原生 RSS 驱动的多社区（NodeSeek + 烧饼论坛 sb.sb）抽奖/福利/特价新帖实时监控、烧饼论坛自动签到与 Telegram 双向交互推送机器人。
+> 默认采用轻量 RSS 客户端的多社区（NodeSeek + 烧饼论坛 sb.sb）抽奖/福利/特价新帖监控与 Telegram 双向交互机器人；烧饼签到可选浏览器运行时。
 
 ---
 
@@ -20,6 +20,8 @@
   - 每日北京时间 **22:00** 准时向 Telegram 推送运行日报，随时发送 `/report` 查阅实时看板。
 - 🍪 **烧饼论坛自动签到与全量通知（可选）**：
   - 支持配置 `SBSB_COOKIE` 自动开启每日自动签到（北京时间每天 08:05 自动执行并回传连续天数、烧饼资产与等级）；
+  - 使用当前官方 `/checkin/` 表单，提交后核验“今日已签到”才记录成功；统计缺失显示“暂未获取”。遇到人机验证时每天提醒一次，当天停止重复提交、继续查询；在浏览器完成签到后可自动确认。调度每 5 分钟检查，08:05 起执行。
+  - 可选浏览器路径使用网站原本的 Cap 组件和提交事件，失败后不补发 HTTP 请求。只查询已签到时明确标为“查询确认”，不归因为本程序提交。
   - 支持在 Telegram 发送 `/signin` 随时一键签到与查分；
   - 实时轮询互动通知（`/u/{uid}/?tab=notifications`）与私信箱（`/messages/`），有人回复主题、点赞支持、@提及或发私信时秒级推送。
 - 📱 **Telegram 原生交互式管理**：
@@ -27,7 +29,7 @@
   - 支持 **`/sources` 网站独立开关**，可一键暂停/开启特定网站推送；
   - 支持 **Inline Keyboard 按钮一键点选删除**，无需手动打字；
   - 支持 **对话引导式添加**，点击 `/add` 直接打字发送即可入库。
-- 🐳 **多架构 Docker 镜像支持**：自动构建发布至 GitHub Container Registry（`linux/amd64` 与 `linux/arm64`），体积仅 30MB，常驻内存仅约 15~20MB。
+- 🐳 **多架构 Docker 镜像支持**：默认轻量镜像发布至 GitHub Container Registry（`linux/amd64` 与 `linux/arm64`）；浏览器候选另用 Playwright 镜像，体积与启动时内存占用更高。
 
 ---
 
@@ -55,6 +57,8 @@
 | `TG_BOT_TOKEN` | **必填** | 无 | 你的 Telegram Bot API Token，用于发送消息和接收指令交互 |
 | `TG_CHAT_ID` | **必填** | 无 | 你的 Telegram 个人纯数字 UID（仅允许管理员本人操作并接收私信推送） |
 | `SBSB_COOKIE` | *可选* | 空 | 烧饼论坛登录 Cookie（填入后自动激活每日 08:05 签到、查分与私信/回帖通知） |
+| `SBSB_BROWSER_SIGNIN` | *可选* | `0` | `1` 使用浏览器签到，须以 `Dockerfile.browser` 构建；正常执行站点验证，服务端拒绝后当天只查询 |
+| `SBSB_BROWSER_MODE` | *可选* | `headless` | `desktop` 使用临时 Xvfb 中的完整 Chromium 与本地 CDP；browser Compose overlay 默认采用此模式 |
 | `AI_API_KEY` | *可选* | 空 | OpenAI-compatible API Key（推荐直接在 .env 注入，免除在 TG 对话框输入密钥） |
 | `AI_ENDPOINT` | *可选* | 空 | API 基础地址，如 `https://api.openai.com/v1` 或 `https://api.deepseek.com/v1` |
 | `AI_MODEL` | *可选* | 空 | 主抽取与判定模型名称（如 `gpt-4o-mini`, `deepseek-chat`） |
@@ -113,6 +117,14 @@ docker compose up -d
 ---
 
 ## ⚙️ 持久化与数据说明
+
+浏览器候选使用官方 Playwright Python 1.63.0 镜像及同版本 SDK，支持 ARM64；可在源码目录通过 `docker compose -f docker-compose.yml -f docker-compose.browser.yml up -d --build` 启用。overlay 默认采用 `desktop`：启动临时 Xvfb 和完整 Chromium，经容器内部回环地址上的 CDP 连接，使用原生窗口尺寸和新建私密上下文，不注入浏览器属性覆盖或伪造验证 token。进程环境排除机器人密钥与 Cookie，不发布调试端口；完成或失败后关闭进程并删除临时资料。
+
+浏览器仅在未签到且允许提交时启动；登录过期或站点策略变化仍可能需要处理。只通过组件和合成测试不代表站点接受，必须有真实表单提交和官方已签到确认；表单导航期间只重试已知执行上下文切换的读取，不追加 POST。
+
+验证接口取自签到表单，允许论坛自身与其官方页面声明的 `https://capjs.net` 服务，仅放行该表单对应的 challenge/redeem 与必要预检。论坛会话仅绑定 `sb.sb`；访问外部验证服务时移除 Cookie 和 Authorization。异常只报告安全阶段与类型，不输出接口响应、会话或验证凭据。
+
+原组件的客户端错误只保留白名单 code；事件 message、token 和未知值不会写入日志。服务端返回 `automated_browser_detected` / `instr_automated_browser` 时明确报告当前运行方式被拒绝，当天停止提交。该浏览器候选无法保证永久通过站方策略，失败时应检查安全阶段日志。
 
 数据持久化保存在挂载的 `./data` 目录下：
 * `settings.json`：存储你动态配置的关键词、网站开关和推送状态；

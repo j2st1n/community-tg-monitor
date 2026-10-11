@@ -1,4 +1,6 @@
 .env
+.env.bak-*
+backups/
 data/*.json
 *.log
 __pycache__/

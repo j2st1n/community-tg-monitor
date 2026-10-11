@@ -166,6 +166,7 @@ class BrowserFlowTest(unittest.TestCase):
         result = browser.run_checkin('session', playwright_factory=factory)
         self.assertFalse(result['success'])
         self.assertEqual('submitted_unconfirmed', result['browser_stage'])
+        self.assertIs(result.get('submission_accepted'), True)
 
     def test_late_cap_body_disposal_uses_confirmed_business_response(self):
         factory, _, _, _, _ = self.fixture(cap=True,outcome='cap_body_disposed')
@@ -177,6 +178,7 @@ class BrowserFlowTest(unittest.TestCase):
         result = browser.run_checkin('session',playwright_factory=factory)
         self.assertFalse(result['success'])
         self.assertEqual('checkin_http_403',result['browser_stage'])
+        self.assertNotIn('submission_accepted', result)
 
     def test_navigation_context_replaced_after_post_waits_for_signed_page(self):
         factory, page, _, _, _ = self.fixture()
@@ -213,7 +215,34 @@ class BrowserFlowTest(unittest.TestCase):
         result = browser.run_checkin('session', playwright_factory=factory)
         self.assertFalse(result['success'])
         self.assertEqual('browser_confirmation_RuntimeError', result['browser_stage'])
+        self.assertIs(result.get('submission_accepted'), True)
         self.assertNotIn('synthetic-private-token', str(result))
+
+    def test_accepted_post_is_preserved_when_delivering_response_to_page_fails(self):
+        factory, _, form, _, _ = self.fixture()
+        context = factory.return_value.__enter__.return_value.chromium.launch.return_value.new_context.return_value
+        # The callback is installed only during run_checkin, so exercise it from click.
+        def submit():
+            handler = context.route.call_args.args[1]
+            route = Mock()
+            route.request = SimpleNamespace(url=browser.CHECKIN_URL, method='POST')
+            route.fetch.return_value = SimpleNamespace(status=200, headers={}, dispose=Mock())
+            route.fulfill.side_effect = RuntimeError('synthetic-private-token')
+            handler(route)
+            route.fetch.assert_called_once()
+        form.locator.side_effect = lambda selector: SimpleNamespace(click=submit)
+        result = browser.run_checkin('session', playwright_factory=factory)
+        self.assertFalse(result['success'])
+        self.assertEqual('post_transport_error', result['browser_stage'])
+        self.assertIs(result.get('submission_accepted'), True)
+        self.assertNotIn('synthetic-private-token', str(result))
+
+    def test_explicit_rejection_or_duplicate_does_not_offer_confirmation_recovery(self):
+        for error in ('automated_browser_detected', 'duplicate_submission_blocked'):
+            state = {'checkin_posts': 1, 'checkin_response': 200, 'error': error}
+            self.assertNotIn('submission_accepted', browser.failure(error, state))
+        state = {'checkin_posts': 2, 'checkin_response': 200, 'error': None}
+        self.assertNotIn('submission_accepted', browser.failure('timeout', state))
 
     def test_errors_are_redacted_and_lock_is_released(self):
         factory, _, _, _, _ = self.fixture()

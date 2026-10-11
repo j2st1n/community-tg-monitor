@@ -81,6 +81,47 @@ class SigninFlowTest(unittest.TestCase):
         self.assertEqual('44 天', result['consecutive_days'])
         self.assertTrue(all(c.args[0].get_method() == 'GET' for c in opener.open.call_args_list))
 
+    def test_accepted_browser_post_with_confirmation_error_is_rechecked_read_only(self):
+        failure = {'success': False, 'needs_human': True,
+                   'browser_stage': 'browser_confirmation_RuntimeError',
+                   'submission_accepted': True, 'msg': 'confirmation failed'}
+        with patch.dict(os.environ, {'SBSB_BROWSER_SIGNIN': '1'}), patch.object(
+            main, 'run_sbsb_browser_checkin', return_value=failure) as runner:
+            result, opener = self.run_flow([Response(UNSIGNED), Response(SIGNED), Response(POINTS)])
+        self.assertTrue(result['success'])
+        self.assertFalse(result['already'])
+        self.assertTrue(result['confirmation_recovered'])
+        self.assertEqual('44 天', result['consecutive_days'])
+        self.assertEqual('44 天', result['total_days'])
+        runner.assert_called_once()
+        self.assertEqual(3, opener.open.call_count)
+        self.assertTrue(all(c.args[0].get_method() == 'GET' for c in opener.open.call_args_list))
+
+    def test_accepted_post_alone_or_unavailable_official_confirmation_remains_failure(self):
+        for response in (Response(UNSIGNED), Response(SIGNED, status=403), OSError('private-token')):
+            with self.subTest(response=type(response).__name__):
+                failure = {'success': False, 'needs_human': True,
+                           'browser_stage': 'browser_confirmation_RuntimeError',
+                           'submission_accepted': True, 'msg': 'confirmation failed'}
+                with patch.dict(os.environ, {'SBSB_BROWSER_SIGNIN': '1'}), patch.object(
+                    main, 'run_sbsb_browser_checkin', return_value=failure) as runner:
+                    result, opener = self.run_flow([Response(UNSIGNED), response])
+                self.assertFalse(result['success'])
+                self.assertNotIn('private-token', str(result))
+                runner.assert_called_once()
+                self.assertEqual(2, opener.open.call_count)
+                self.assertTrue(all(c.args[0].get_method() == 'GET' for c in opener.open.call_args_list))
+
+    def test_untyped_accepted_marker_does_not_trigger_reconfirmation(self):
+        failure = {'success': False, 'needs_human': True,
+                   'browser_stage': 'browser_confirmation_RuntimeError',
+                   'submission_accepted': 'true', 'msg': 'confirmation failed'}
+        with patch.dict(os.environ, {'SBSB_BROWSER_SIGNIN': '1'}), patch.object(
+            main, 'run_sbsb_browser_checkin', return_value=failure):
+            result, opener = self.run_flow([Response(UNSIGNED)])
+        self.assertFalse(result['success'])
+        self.assertEqual(1, opener.open.call_count)
+
     def test_query_only_never_starts_browser_even_when_enabled(self):
         with patch.dict(os.environ, {'SBSB_BROWSER_SIGNIN': '1'}), patch.object(
             main, 'run_sbsb_browser_checkin') as runner:

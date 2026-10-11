@@ -933,6 +933,8 @@ def do_sbsb_signin(cookie, allow_submit=True):
             return None
 
     opener = urllib.request.build_opener(NoRedirectHandler)
+    browser_failure = None
+    confirmation_recovered = False
 
     def read_response(req):
         try:
@@ -966,8 +968,12 @@ def do_sbsb_signin(cookie, allow_submit=True):
                 browser_result = run_sbsb_browser_checkin(cookie, page.cap_endpoint)
                 print(f"[{datetime.now()}] 🍪 浏览器签到阶段: {browser_result.get('browser_stage', 'unknown')}", flush=True)
                 if not browser_result.get("success"):
-                    return browser_result
-                already_signed = browser_result.get("already", False)
+                    if browser_result.get("submission_accepted") is not True:
+                        return browser_result
+                    browser_failure = browser_result
+                    already_signed = False
+                else:
+                    already_signed = browser_result.get("already", False)
             else:
                 post_headers = dict(headers)
                 post_headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -982,9 +988,16 @@ def do_sbsb_signin(cookie, allow_submit=True):
             status, html_signin = read_response(urllib.request.Request(SBSB_CHECKIN_URL, headers=headers))
             page = SbsbSigninPageParser(html_signin)
             if status != 200 or not page.signed:
+                if browser_failure is not None:
+                    return browser_failure
                 reason = "页面要求人机验证，请在浏览器完成签到" if page.has_captcha else "官方页面仍未确认今日已签到"
                 return {"success": False, "needs_human": page.has_captcha, "msg": reason}
+            if browser_failure is not None:
+                confirmation_recovered = True
+                print(f"[{datetime.now()}] 🍪 浏览器签到阶段: submitted_confirmed（官方只读查询补确认）", flush=True)
     except Exception as exc:
+        if browser_failure is not None:
+            return browser_failure
         # Do not expose request headers, form tokens or raw HTML in Telegram.
         return {"success": False, "msg": f"访问官方签到页面异常 ({type(exc).__name__})"}
 
@@ -1039,6 +1052,7 @@ def do_sbsb_signin(cookie, allow_submit=True):
     return {
         "success": True,
         "already": already_signed,
+        "confirmation_recovered": confirmation_recovered,
         "msg": flash_msg,
         "consecutive_days": streak_days,
         "total_days": total_days,

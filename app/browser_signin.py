@@ -69,13 +69,19 @@ def request_allowed(url, method, post_urls, allow_submit):
             and not parts.query)
 
 
-def failure(code):
+def failure(code, state=None):
     if code in ("automated_browser_detected", "instr_automated_browser"):
         message = "站方验证明确拒绝自动化浏览器；当天停止自动提交，请核对浏览器运行方式"
     else:
         message = "浏览器签到未完成（" + code + "）；当天停止自动提交，请人工核对"
-    return {"success": False, "needs_human": True, "browser_stage": code,
-            "msg": message}
+    result = {"success": False, "needs_human": True, "browser_stage": code,
+              "msg": message}
+    # This evidence permits only a fresh official GET, never success by itself.
+    if (state is not None and state["checkin_posts"] == 1
+            and state["checkin_response"] in (200, 302, 303)
+            and state["error"] in (None, "post_transport_error")):
+        result["submission_accepted"] = True
+    return result
 
 
 def post_response_allowed(url, status, location):
@@ -98,6 +104,7 @@ def run_checkin(cookie, allow_submit=True, cap_endpoint=None, *, playwright_fact
     if not _LOCK.acquire(blocking=False):
         return failure("browser_busy")
     browser = None
+    state = None
     phase = "inputs"
     try:
         try:
@@ -170,6 +177,8 @@ def run_checkin(cookie, allow_submit=True, cap_endpoint=None, *, playwright_fact
                             state["error"] = "unexpected_post_redirect"
                             route.fulfill(status=409, content_type="text/plain", body="Redirect blocked")
                         else:
+                            if request.url == CHECKIN_URL:
+                                state["checkin_response"] = response.status
                             route.fulfill(response=response)
                     except Exception:
                         state["error"] = "post_transport_error"
@@ -266,14 +275,14 @@ def run_checkin(cookie, allow_submit=True, cap_endpoint=None, *, playwright_fact
                 try:
                     page.wait_for_timeout(250)
                     if state["error"]:
-                        return failure(state["error"])
+                        return failure(state["error"], state)
                     if state["checkin_response"] is not None and state["navigated"]:
                         if state["checkin_response"] not in (200, 302, 303):
-                            return failure("checkin_http_" + str(state["checkin_response"]))
+                            return failure("checkin_http_" + str(state["checkin_response"]), state)
                         page.wait_for_load_state("domcontentloaded", timeout=15000)
                         if page.url == CHECKIN_URL and page.evaluate(_SIGNED_JS):
                             return {"success": True, "already": False, "browser_stage": "submitted_confirmed"}
-                        return failure("submitted_unconfirmed")
+                        return failure("submitted_unconfirmed", state)
                     # Once the original form POST starts, its navigation owns the
                     # result. Do not read the outgoing widget's destroyed context.
                     if state["checkin_posts"]:
@@ -287,9 +296,9 @@ def run_checkin(cookie, allow_submit=True, cap_endpoint=None, *, playwright_fact
                     if state["checkin_posts"] and _navigation_context_changed(exc):
                         continue
                     raise
-            return failure("verification_timeout")
+            return failure("verification_timeout", state)
     except Exception as exc:
         # Exception strings can contain URLs, form fields or tokens. Use only type.
-        return failure("browser_" + phase + "_" + type(exc).__name__)
+        return failure("browser_" + phase + "_" + type(exc).__name__, state)
     finally:
         _LOCK.release()

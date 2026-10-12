@@ -122,7 +122,12 @@ def run_checkin(cookie, allow_submit=True, cap_endpoint=None, *, playwright_fact
             return failure("invalid_browser_mode")
         if playwright_factory is None:
             if mode == "desktop":
-                from app.browser_runtime import desktop_playwright
+                # Docker runs main.py as a file, so this module can be imported
+                # either as an app package member or as a sibling module.
+                if __package__:
+                    from .browser_runtime import desktop_playwright
+                else:
+                    from browser_runtime import desktop_playwright
                 playwright_factory = desktop_playwright
             else:
                 from playwright.sync_api import sync_playwright

@@ -25,9 +25,9 @@ except ModuleNotFoundError:
     )
 
 try:
-    from app.participation import ContentPlanner, build_participant
+    from app.participation import ContentPlanner, TopicPage, build_participant
 except ModuleNotFoundError:
-    from participation import ContentPlanner, build_participant
+    from participation import ContentPlanner, TopicPage, build_participant
 
 APP_VERSION = "5.1"
 APP_USER_AGENT = f"Community-Monitor-Bot/{APP_VERSION}"
@@ -888,7 +888,7 @@ class BotManager:
                 lines.append(f"  跳过 {counts['skipped']} / 需人工处理 {counts['review']} / 待重试 {counts['retry']}")
             lines.extend([
                 f"• ⏳ 当前随机等待: <b>{participation['waiting']}</b> 项",
-                f"• 🍪 当日保守预算占用: <b>{participation['reserved_cost']}/{self.participant.daily}</b> 饼 | 提交预留 <b>{participation['reserved_count']}/{self.participant.max_daily}</b> 次",
+                f"• 🍪 当日保守预算占用: <b>{participation['reserved_cost']}/{self.participant.daily}</b> 饼 | 提交预留 <b>{participation['reserved_count']}</b> 次",
                 "• 口径: 当日账本按活动去重；账号已参与不归因于自动提交；参与不代表中奖或到账；预算占用并非实际扣饼。",
             ])
         return "\n".join(lines)
@@ -2133,6 +2133,50 @@ def parse_sbsb_notifications(html_text, default_uid=""):
     return notifications
 
 
+class SbsbIdentityError(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def fetch_sbsb_current_uid(cookie, opener):
+    """Read fresh official navigation; never infer identity from post authors."""
+    if not cookie:
+        raise SbsbIdentityError("identity_unconfirmed")
+    cookie = cookie if "=" in cookie else f"__Host-bbs_session={cookie}"
+    req = urllib.request.Request("https://sb.sb/", headers={
+        "User-Agent": APP_USER_AGENT, "Cookie": cookie,
+        "Referer": "https://sb.sb/", "Cache-Control": "no-cache",
+    })
+    try:
+        with opener.open(req, timeout=12) as response:
+            status = getattr(response, "status", getattr(response, "code", 200))
+            if status != 200:
+                raise SbsbIdentityError("identity_query_failed")
+            raw = response.read(1500001)
+            if len(raw) > 1500000:
+                raise SbsbIdentityError("identity_page_too_large")
+    except urllib.error.HTTPError as exc:
+        location = urllib.parse.urlsplit(urllib.parse.urljoin("https://sb.sb/", exc.headers.get("Location", "")))
+        login = (exc.code in (301, 302, 303, 307, 308) and location.scheme == "https"
+                 and location.netloc == "sb.sb" and location.path in ("/login", "/login/"))
+        exc.close()
+        raise SbsbIdentityError("login_required" if login else "identity_query_failed") from None
+    except (urllib.error.URLError, TimeoutError):
+        raise SbsbIdentityError("identity_query_failed") from None
+    except SbsbIdentityError:
+        raise
+    except Exception:
+        raise SbsbIdentityError("identity_query_failed") from None
+    try:
+        uid = TopicPage(raw.decode("utf-8", errors="replace"), "redpacket").uid
+    except Exception:
+        raise SbsbIdentityError("identity_unconfirmed") from None
+    if not re.fullmatch(r"[1-9]\d*", uid):
+        raise SbsbIdentityError("identity_unconfirmed")
+    return uid
+
+
 def sbsb_private_messages_thread(bot):
     """烧饼论坛互动通知（回复/点赞/提及）与私信轮询线程"""
     if not bot.sbsb_cookie:
@@ -2143,40 +2187,34 @@ def sbsb_private_messages_thread(bot):
     first_run = len(bot.seen_msgs) == 0
 
     class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-        def http_error_302(self, req, fp, code, msg, headers):
-            return fp
-        def http_error_303(self, req, fp, code, msg, headers):
-            return fp
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
 
     opener = urllib.request.build_opener(NoRedirectHandler)
 
-    def get_user_uid():
-        if bot.sbsb_uid:
-            return bot.sbsb_uid
-        try:
-            req = urllib.request.Request(
-                "https://sb.sb/",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                    "Cookie": bot.sbsb_cookie,
-                    "Referer": "https://sb.sb/"
-                }
-            )
-            resp = opener.open(req, timeout=12)
-            html_text = resp.read().decode("utf-8", errors="ignore")
-            uid_m = re.search(r'/u/(\d+)/\?tab=notifications', html_text) or re.search(r'/u/(\d+)/', html_text)
-            if uid_m:
-                bot.sbsb_uid = uid_m.group(1)
-                print(f"[{datetime.now()}] 🆔 成功识别烧饼论坛当前用户 UID: {bot.sbsb_uid}", flush=True)
-                return bot.sbsb_uid
-        except Exception as ue:
-            print(f"[{datetime.now()}] 获取 UID 失败: {ue}", flush=True)
-        return "7069"
+    def warn_login_required():
+        now_ts = time.time()
+        if now_ts - bot.last_cookie_warn_time > 43200:
+            bot.last_cookie_warn_time = now_ts
+            bot.send_msg(bot.admin_chat_id, (
+                "⚠️ <b>🍪 [烧饼论坛] 登录凭据 (SBSB_COOKIE) 已过期！</b>\n\n"
+                "请在电脑浏览器重新登录烧饼论坛并复制 Cookie，更新至 VPS 的 <code>.env</code> 中。"
+            ))
 
     while True:
         try:
-            uid = get_user_uid()
-            notif_url = f"https://sb.sb/u/{uid}/?tab=notifications"
+            try:
+                uid = fetch_sbsb_current_uid(bot.sbsb_cookie, opener)
+            except SbsbIdentityError as exc:
+                bot.sbsb_uid = None
+                print(f"[{datetime.now()}] 获取烧饼 UID 未确认: {exc.code}", flush=True)
+                if exc.code == "login_required": warn_login_required()
+                time.sleep(DEFAULT_PRIVATE_INTERVAL)
+                continue
+            if bot.sbsb_uid != uid:
+                bot.sbsb_uid = uid
+                print(f"[{datetime.now()}] 🆔 成功识别烧饼论坛当前用户 UID: {uid}", flush=True)
+            notif_url = f"https://sb.sb/u/{uid}/notifications/"
 
             # 1. 拉取互动通知页（回复、点亮、提及、支持等）
             req_notif = urllib.request.Request(
@@ -2190,25 +2228,26 @@ def sbsb_private_messages_thread(bot):
             )
 
             try:
-                resp_notif = opener.open(req_notif, timeout=15)
-                status_code = getattr(resp_notif, "status", getattr(resp_notif, "code", 200))
-                location = resp_notif.headers.get("Location", "")
-                if status_code in [302, 303] and ("login" in location or "/login" in location):
-                    now_ts = time.time()
-                    if now_ts - bot.last_cookie_warn_time > 43200:
-                        bot.last_cookie_warn_time = now_ts
-                        warn_msg = (
-                            "⚠️ <b>🍪 [烧饼论坛] 登录凭据 (SBSB_COOKIE) 已过期！</b>\n\n"
-                            "互动通知推送与自动签到已暂停。请在电脑浏览器重新登录烧饼论坛并复制 Cookie，更新至 VPS 的 <code>.env</code> 中。"
-                        )
-                        bot.send_msg(bot.admin_chat_id, warn_msg)
-                        print(f"[{datetime.now()}] ⚠️ 烧饼论坛 Cookie 已过期 (重定向至 {location})", flush=True)
-                    time.sleep(DEFAULT_PRIVATE_INTERVAL)
-                    continue
-
-                html_notif = resp_notif.read().decode("utf-8", errors="ignore")
+                with opener.open(req_notif, timeout=15) as resp_notif:
+                    if getattr(resp_notif, "status", getattr(resp_notif, "code", 200)) != 200:
+                        raise SbsbIdentityError("notification_query_failed")
+                    raw_notif = resp_notif.read(1500001)
+                    if len(raw_notif) > 1500000:
+                        raise SbsbIdentityError("notification_page_too_large")
+                    html_notif = raw_notif.decode("utf-8", errors="replace")
+                if TopicPage(html_notif, "redpacket").uid != uid:
+                    bot.sbsb_uid = None
+                    raise SbsbIdentityError("notification_identity_changed")
             except Exception as fe:
-                print(f"[{datetime.now()}] 拉取烧饼通知失败: {fe}", flush=True)
+                bot.sbsb_uid = None
+                if isinstance(fe, urllib.error.HTTPError):
+                    location = urllib.parse.urlsplit(urllib.parse.urljoin("https://sb.sb/", fe.headers.get("Location", "")))
+                    if (fe.code in (301, 302, 303, 307, 308) and location.scheme == "https"
+                            and location.netloc == "sb.sb" and location.path in ("/login", "/login/")):
+                        warn_login_required()
+                    fe.close()
+                code = fe.code if isinstance(fe, SbsbIdentityError) else type(fe).__name__
+                print(f"[{datetime.now()}] 拉取烧饼通知未确认: {code}", flush=True)
                 time.sleep(DEFAULT_PRIVATE_INTERVAL)
                 continue
 

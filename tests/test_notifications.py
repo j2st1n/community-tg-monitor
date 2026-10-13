@@ -1,5 +1,165 @@
 import unittest
+import io
+import urllib.error
+import urllib.response
+from email.message import Message
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from app import main
+
+
+class StopPolling(BaseException):
+    pass
+
+
+class SbsbIdentityRefreshTest(unittest.TestCase):
+    @staticmethod
+    def homepage(uid):
+        return ('<div class="top"><div class="nav-user-links">'
+                f'<a href="/u/{uid}/">主页</a><a href="/u/{uid}/notifications/">通知</a>'
+                '</div></div><div class="post-content"><a href="/u/999/">正文中的用户</a></div>')
+
+    @staticmethod
+    def response(body, status=200, headers=None):
+        r = Mock(status=status, headers=headers or {})
+        r.read.return_value = body.encode()
+        r.__enter__ = Mock(return_value=r)
+        r.__exit__ = Mock(return_value=False)
+        return r
+
+    @staticmethod
+    def bot(uid=None):
+        return SimpleNamespace(sbsb_cookie='synthetic-session=value', sbsb_uid=uid,
+                               seen_msgs={'existing'}, last_cookie_warn_time=0,
+                               admin_chat_id='synthetic-chat', send_msg=Mock(),
+                               save_seen_msgs=Mock(), remember_seen_msg=Mock(return_value=False))
+
+    def test_uid_changes_without_restart_and_seen_records_are_preserved(self):
+        bot = self.bot()
+        requested, homes = [], []
+        def request(req, timeout):
+            requested.append(req.full_url)
+            if req.full_url == 'https://sb.sb/':
+                uid = '7' if not homes else '9'
+                homes.append(uid)
+                return self.response(self.homepage(uid))
+            if req.full_url.endswith('/notifications/'):
+                return self.response(self.homepage(homes[-1]))
+            self.assertEqual(req.full_url, 'https://sb.sb/messages/')
+            return self.response('')
+        opener = Mock()
+        opener.open.side_effect = request
+        with patch.object(main.urllib.request, 'build_opener', return_value=opener), \
+             patch.object(main.time, 'sleep', side_effect=[None, StopPolling]), \
+             patch('builtins.print'):
+            with self.assertRaises(StopPolling): main.sbsb_private_messages_thread(bot)
+        notifications = [u for u in requested if u.endswith('/notifications/')]
+        self.assertEqual(notifications, ['https://sb.sb/u/7/notifications/',
+                                         'https://sb.sb/u/9/notifications/'])
+        self.assertEqual(homes, ['7', '9'])
+        self.assertEqual(bot.sbsb_uid, '9')
+        self.assertEqual(bot.seen_msgs, {'existing'})
+        bot.send_msg.assert_not_called()
+
+    def test_missing_identity_does_not_reuse_cached_uid_or_visit_notifications(self):
+        bot = self.bot('7')
+        opener = Mock()
+        opener.open.return_value = self.response('<a href="/u/999/">帖子作者</a>')
+        with patch.object(main.urllib.request, 'build_opener', return_value=opener), \
+             patch.object(main.time, 'sleep', side_effect=StopPolling), patch('builtins.print'):
+            with self.assertRaises(StopPolling): main.sbsb_private_messages_thread(bot)
+        self.assertIsNone(bot.sbsb_uid)
+        self.assertEqual([c.args[0].full_url for c in opener.open.call_args_list], ['https://sb.sb/'])
+        bot.send_msg.assert_not_called()
+        bot.save_seen_msgs.assert_not_called()
+
+    def test_identity_comes_only_from_navigation_and_requires_unique_uid(self):
+        for body in (self.homepage('7'), '<header><a href="/u/7/?tab=notifications">通知</a></header>'):
+            opener = Mock()
+            opener.open.return_value = self.response(body)
+            self.assertEqual(main.fetch_sbsb_current_uid('synthetic-token', opener), '7')
+            req = opener.open.call_args.args[0]
+            self.assertEqual(req.get_method(), 'GET')
+            self.assertEqual(req.full_url, 'https://sb.sb/')
+            self.assertEqual(req.get_header('Cookie'), '__Host-bbs_session=synthetic-token')
+        for body in ('<a href="/u/999/">作者</a>', self.homepage('0'),
+                     self.homepage('7').replace('</div></div>', '<a href="/u/9/">其他身份</a></div></div>')):
+            opener.open.return_value = self.response(body)
+            with self.assertRaises(main.SbsbIdentityError) as exc:
+                main.fetch_sbsb_current_uid('synthetic-token', opener)
+            self.assertEqual(exc.exception.code, 'identity_unconfirmed')
+
+    def test_identity_query_failures_are_safe_and_do_not_guess(self):
+        for error in (TimeoutError('synthetic-secret'), urllib.error.URLError('synthetic-secret'),
+                      RuntimeError('synthetic-secret')):
+            opener = Mock()
+            opener.open.side_effect = error
+            with self.assertRaises(main.SbsbIdentityError) as exc:
+                main.fetch_sbsb_current_uid('synthetic-token', opener)
+            self.assertEqual(exc.exception.code, 'identity_query_failed')
+            self.assertNotIn('synthetic-secret', str(exc.exception))
+        opener = Mock()
+        with self.assertRaises(main.SbsbIdentityError): main.fetch_sbsb_current_uid('', opener)
+        opener.open.assert_not_called()
+
+    def test_identity_rejects_non_success_or_oversized_pages(self):
+        for response, expected in ((self.response(self.homepage('7'), status=503), 'identity_query_failed'),
+                                   (self.response('x' * 1500001), 'identity_page_too_large')):
+            opener = Mock()
+            opener.open.return_value = response
+            with self.assertRaises(main.SbsbIdentityError) as exc:
+                main.fetch_sbsb_current_uid('synthetic-token', opener)
+            self.assertEqual(exc.exception.code, expected)
+
+    def test_login_redirect_warns_once_and_skips_notification_fetch(self):
+        bot = self.bot('7')
+        opener = Mock()
+        def redirect(req, **kw):
+            raise urllib.error.HTTPError(req.full_url, 302, 'redirect', {'Location': '/login/'}, io.BytesIO())
+        opener.open.side_effect = redirect
+        with patch.object(main.urllib.request, 'build_opener', return_value=opener), \
+             patch.object(main.time, 'sleep', side_effect=[None, StopPolling]), \
+             patch.object(main.time, 'time', return_value=100000), patch('builtins.print'):
+            with self.assertRaises(StopPolling): main.sbsb_private_messages_thread(bot)
+        self.assertIsNone(bot.sbsb_uid)
+        self.assertEqual(bot.send_msg.call_count, 1)
+        self.assertTrue(all(c.args[0].full_url == 'https://sb.sb/' for c in opener.open.call_args_list))
+
+    def test_redirects_are_never_followed_or_sent_cookie_to_other_origin(self):
+        build_opener = main.urllib.request.build_opener
+        for status in (301, 302, 303, 307, 308):
+            requested = []
+            class Redirect(main.urllib.request.BaseHandler):
+                handler_order = 100
+                def https_open(self, req):
+                    requested.append(req.full_url)
+                    headers = Message()
+                    headers['Location'] = 'https://invalid.example/u/7/'
+                    r = urllib.response.addinfourl(io.BytesIO(), headers, req.full_url, status)
+                    r.msg = 'redirect'
+                    return r
+            def fake_opener(*handlers):
+                return build_opener(*handlers, Redirect())
+            bot = self.bot('7')
+            with patch.object(main.urllib.request, 'build_opener', side_effect=fake_opener), \
+                 patch.object(main.time, 'sleep', side_effect=StopPolling), patch('builtins.print'):
+                with self.assertRaises(StopPolling): main.sbsb_private_messages_thread(bot)
+            self.assertEqual(requested, ['https://sb.sb/'])
+            self.assertIsNone(bot.sbsb_uid)
+            bot.send_msg.assert_not_called()
+
+    def test_notification_identity_change_is_rejected_before_processing(self):
+        bot = self.bot('7')
+        opener = Mock()
+        opener.open.side_effect = [self.response(self.homepage('7')), self.response(self.homepage('9'))]
+        with patch.object(main.urllib.request, 'build_opener', return_value=opener), \
+             patch.object(main.time, 'sleep', side_effect=StopPolling), \
+             patch.object(main, 'parse_sbsb_notifications') as parse, patch('builtins.print'):
+            with self.assertRaises(StopPolling): main.sbsb_private_messages_thread(bot)
+        self.assertIsNone(bot.sbsb_uid)
+        parse.assert_not_called()
+        bot.send_msg.assert_not_called()
+        self.assertEqual(bot.seen_msgs, {'existing'})
 
 
 class SbsbNotificationParserTest(unittest.TestCase):

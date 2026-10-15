@@ -8,6 +8,7 @@ import re
 import hashlib
 import traceback
 import threading
+import tempfile
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -28,6 +29,25 @@ try:
     from app.participation import ContentPlanner, TopicPage, build_participant
 except ModuleNotFoundError:
     from participation import ContentPlanner, TopicPage, build_participant
+
+try:
+    from app.telegram_ui import TelegramUI, format_activity
+    from app.telegram_text import (escape as tg_escape, plain as tg_plain, clip as tg_clip,
+                                   split_html, fit_html, valid_markup, keyboard, callback, url_button)
+    from app.signin_state import (CST, UNKNOWN, SigninStore, StateError, PointsParser,
+                                  period_key, period_start, due as signin_due,
+                                  confirmed as signin_confirmed, blocked as signin_blocked,
+                                  record_result as record_signin_result, summary as signin_summary)
+    from app.signin_feedback import format_signin, signin_markup
+except ModuleNotFoundError:
+    from telegram_ui import TelegramUI, format_activity
+    from telegram_text import (escape as tg_escape, plain as tg_plain, clip as tg_clip,
+                               split_html, fit_html, valid_markup, keyboard, callback, url_button)
+    from signin_state import (CST, UNKNOWN, SigninStore, StateError, PointsParser,
+                              period_key, period_start, due as signin_due,
+                              confirmed as signin_confirmed, blocked as signin_blocked,
+                              record_result as record_signin_result, summary as signin_summary)
+    from signin_feedback import format_signin, signin_markup
 
 APP_VERSION = "5.1"
 APP_USER_AGENT = f"Community-Monitor-Bot/{APP_VERSION}"
@@ -76,10 +96,10 @@ DEFAULT_KEYWORDS = []
 
 # 精简后的 4 大核心指令
 BOT_COMMANDS = [
-    {"command": "status", "description": "📊 运行状态与控制台"},
-    {"command": "keywords", "description": "🎯 自定义关注雷达"},
-    {"command": "sources", "description": "📡 监控网站独立推送开关"},
-    {"command": "signin", "description": "🍪 烧饼论坛一键签到与查分"},
+    {"command": "status", "description": "运行状态"},
+    {"command": "keywords", "description": "关注词"},
+    {"command": "sources", "description": "推送与自动参与"},
+    {"command": "signin", "description": "烧饼签到与查询"},
 ]
 
 LEGACY_BUILTIN_WORDS = {
@@ -89,7 +109,7 @@ LEGACY_BUILTIN_WORDS = {
 }
 
 
-class BotManager:
+class BotManager(TelegramUI):
     def __init__(self):
         self.bot_token = os.environ.get("TG_BOT_TOKEN", "").strip()
         self.admin_chat_id = str(os.environ.get("TG_CHAT_ID", "")).strip()
@@ -170,6 +190,18 @@ class BotManager:
         tz_cst = timezone(timedelta(hours=8))
         return datetime.now(tz_cst).strftime("%Y-%m-%d")
 
+    def local_now(self):
+        return datetime.now(CST)
+
+    def signin_status(self):
+        try:
+            return signin_summary(SigninStore(CHECKIN_STATE_FILE).load(), self.local_now(), bool(self.sbsb_cookie))
+        except StateError:
+            return "记录读取异常，状态待查询"
+
+    def query_signin(self, chat_id, allow_submit=False):
+        return execute_sbsb_signin(self, chat_id, allow_submit=allow_submit)
+
     def load_daily_stats(self):
         today = self.get_today_cst()
         default_stats = {
@@ -242,23 +274,12 @@ class BotManager:
     def register_telegram_commands(self):
         if not self.bot_token:
             return
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
-        payload = {"commands": BOT_COMMANDS}
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            api_url,
-            data=data,
-            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    print(f"[{datetime.now()}] ✅ Telegram 官方快捷指令菜单已自动注册！", flush=True)
-        except Exception as e:
-            print(f"[{datetime.now()}] ⚠️ 注册菜单失败: {e}", flush=True)
+        accepted = self._telegram_call("setMyCommands", {"commands": BOT_COMMANDS})
+        print(f"[{datetime.now()}] Telegram 指令菜单注册: {'已确认' if accepted else '未确认'}", flush=True)
 
     def load_settings(self):
         os.makedirs(DATA_DIR, exist_ok=True)
+        saved_ai_enabled = False
         # Older settings have only notification switches. Preserve the separately
         # configured participation service, even when notifications are muted.
         self.sbsb_participation_enabled = True
@@ -266,6 +287,7 @@ class BotManager:
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                    saved_ai_enabled = "ai_enabled" in data
                     raw_keywords = data.get("keywords", [])
                     self.keywords = [k for k in raw_keywords if k not in LEGACY_BUILTIN_WORDS]
                     self.poll_interval = data.get("poll_interval", DEFAULT_POLL_INTERVAL)
@@ -293,7 +315,6 @@ class BotManager:
             self.ai_judge_model = ""
             self.ai_accept_threshold = 0.90
             self.source_states = {s["id"]: True for s in self.sources}
-            self.save_settings()
 
         # 环境变量优先覆盖与默认激活
         if self.env_ai_endpoint:
@@ -306,8 +327,10 @@ class BotManager:
             self.ai_accept_threshold = min(0.99, max(0.70, self.env_ai_accept_threshold))
         if self.env_ai_enabled is not None:
             self.ai_enabled = self.env_ai_enabled
-        elif not self.ai_enabled and self.env_ai_api_key and self.ai_endpoint and self.ai_model:
+        elif not saved_ai_enabled and self.env_ai_api_key and self.ai_endpoint and self.ai_model:
             self.ai_enabled = True
+        if not saved_ai_enabled:
+            self.save_settings()
 
     def save_settings(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -323,8 +346,17 @@ class BotManager:
             "ai_judge_model": self.ai_judge_model,
             "ai_accept_threshold": self.ai_accept_threshold
         }
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with self.lock:
+            fd, path = tempfile.mkstemp(prefix=".settings-", dir=DATA_DIR)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as file:
+                    json.dump(data, file, ensure_ascii=False, indent=2)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(path, SETTINGS_FILE)
+            finally:
+                if os.path.exists(path):
+                    os.unlink(path)
 
     def load_ai_secret(self):
         if self.env_ai_api_key:
@@ -425,55 +457,6 @@ class BotManager:
             return "••••••••"
         return f"{self.ai_api_key[:3]}••••{self.ai_api_key[-4:]}"
 
-    def format_ai_card(self):
-        configured = bool(self.ai_endpoint and self.ai_model and self.ai_api_key)
-        running = self.ai_is_ready()
-        source_tags = []
-        if self.env_ai_api_key:
-            source_tags.append("Key")
-        if self.env_ai_endpoint:
-            source_tags.append("API")
-        if self.env_ai_model:
-            source_tags.append("模型")
-        env_source_desc = f"🔒 .env 注入 ({', '.join(source_tags)})" if source_tags else "本地存储"
-
-        status_text = '🟢 运行中' if running else ('🟡 已配置但未启用' if configured else '⚪ 配置未完成')
-        judge_text = self.ai_judge_model or '跟随主模型'
-        lines = [
-            "🧠 <b>NodeSeek AI 抽奖判定</b>",
-            "",
-            f"• 状态: {status_text}",
-            f"• 配置来源: <code>{env_source_desc}</code>",
-            f"• API: <code>{html.escape(self.ai_endpoint or '未设置')}</code>",
-            f"• 模型: <code>{html.escape(self.ai_model or '未设置')}</code>",
-            f"• 复审模型: <code>{html.escape(judge_text)}</code>",
-            f"• API Key: <code>{html.escape(self.masked_ai_key())}</code>",
-            f"• 自动通过阈值: <code>{self.ai_accept_threshold:.2f}</code>",
-            f"• 待判定队列: <b>{len(self.nodeseek_ai_pending)}</b> 篇",
-            f"• 待人工复核: <b>{len(self.nodeseek_ai_review)}</b> 篇",
-            "",
-            "<i>💡 最佳实践：直接在服务器 .env 中配置 <code>AI_API_KEY</code> 等变量，安全且无需在对话框输入任何密钥。</i>"
-        ]
-        text = "\n".join(lines)
-        markup = {
-            "inline_keyboard": [
-                [
-                    {"text": "🔌 设置 API", "callback_data": "ai:set_endpoint"},
-                    {"text": "🔑 设置 Key", "callback_data": "ai:set_key"},
-                ],
-                [
-                    {"text": "🤖 设置模型", "callback_data": "ai:set_model"},
-                    {"text": "⚖️ 复审模型", "callback_data": "ai:set_judge"},
-                ],
-                [{"text": "🎚️ 设置阈值", "callback_data": "ai:set_threshold"}],
-                [
-                    {"text": "🧪 测试连接", "callback_data": "ai:test"},
-                    {"text": "⏯️ 启用/停用", "callback_data": "ai:toggle"},
-                ],
-            ]
-        }
-        return text, markup
-
     def test_ai_connection(self):
         classifier = self.build_ai_classifier()
         facts = classifier.extract_facts({
@@ -494,7 +477,11 @@ class BotManager:
         with self.lock:
             current = self.source_states.get(source_id, True)
             self.source_states[source_id] = not current
-            self.save_settings()
+            try:
+                self.save_settings()
+            except Exception:
+                self.source_states[source_id] = current
+                raise
             return self.source_states[source_id]
 
     def is_sbsb_participation_allowed(self):
@@ -506,7 +493,11 @@ class BotManager:
     def toggle_sbsb_participation(self):
         with self.lock:
             self.sbsb_participation_enabled = not self.sbsb_participation_enabled
-            self.save_settings()
+            try:
+                self.save_settings()
+            except Exception:
+                self.sbsb_participation_enabled = not self.sbsb_participation_enabled
+                raise
             return self.sbsb_participation_enabled
 
     def run_sbsb_participation(self, topics):
@@ -618,294 +609,62 @@ class BotManager:
         with open(SBSB_EVENTS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def send_msg(self, chat_id, text, reply_markup=None, disable_preview=True, retries=2):
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": disable_preview
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        data = json.dumps(payload).encode("utf-8")
+    def _telegram_call(self, method, payload, retries=0):
+        api_url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         for attempt in range(retries + 1):
-            req = urllib.request.Request(
-                api_url,
-                data=data,
-                headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT}
-            )
+            req = urllib.request.Request(api_url, data=data, headers={
+                "Content-Type": "application/json", "User-Agent": APP_USER_AGENT})
             try:
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    if resp.status == 200:
-                        return True
-            except urllib.error.HTTPError as he:
-                if he.code == 429:
-                    time.sleep(2)
-                else:
-                    print(f"[{datetime.now()}] TG 发送 HTTP {he.code}: {he}", flush=True)
+                with urllib.request.urlopen(req, timeout=12) as response:
+                    result = json.loads(response.read(65536).decode("utf-8"))
+                    accepted = response.status == 200 and result.get("ok") is True
+                    return accepted and (method != "deleteMessage" or result.get("result") is True)
+            except urllib.error.HTTPError as exc:
+                if method == "editMessageText" and exc.code == 400:
+                    try:
+                        result = json.loads(exc.read(65536).decode("utf-8"))
+                        if str(result.get("description", "")).startswith("Bad Request: message is not modified"):
+                            return True
+                    except Exception:
+                        pass
+                print(f"[{datetime.now()}] TG {method} HTTP {exc.code}", flush=True)
+                exc.close()
+                if exc.code != 429:
                     break
-            except Exception as e:
-                print(f"[{datetime.now()}] TG 发送异常 (尝试 {attempt+1}/{retries+1}): {e}", flush=True)
-                time.sleep(1)
+            except Exception as exc:
+                print(f"[{datetime.now()}] TG {method} 未确认: {type(exc).__name__}", flush=True)
+            if attempt < retries:
+                time.sleep(2)
         return False
 
+    def send_msg(self, chat_id, text, reply_markup=None, disable_preview=True, retries=2):
+        chunks = split_html(text)
+        for index, chunk in enumerate(chunks):
+            payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML",
+                       "disable_web_page_preview": disable_preview}
+            markup = valid_markup(reply_markup) if index == len(chunks) - 1 else None
+            if markup:
+                payload["reply_markup"] = markup
+            if not self._telegram_call("sendMessage", payload, retries=retries):
+                return False
+        return True
+
     def edit_msg_text(self, chat_id, message_id, text, reply_markup=None):
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/editMessageText"
-        payload = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text,
-            "parse_mode": "HTML"
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            api_url,
-            data=data,
-            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status == 200
-        except Exception as e:
-            print(f"[{datetime.now()}] 编辑消息失败: {e}", flush=True)
-            return False
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": fit_html(text),
+                   "parse_mode": "HTML", "reply_markup": valid_markup(reply_markup) or {"inline_keyboard": []}}
+        return self._telegram_call("editMessageText", payload)
 
     def delete_msg(self, chat_id, message_id):
         if not self.bot_token or not chat_id or not message_id:
             return False
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/deleteMessage"
-        payload = {"chat_id": chat_id, "message_id": message_id}
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            api_url,
-            data=data,
-            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+        return self._telegram_call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
     def answer_callback_query(self, callback_query_id, text):
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/answerCallbackQuery"
-        payload = {"callback_query_id": callback_query_id, "text": text, "show_alert": False}
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            api_url,
-            data=data,
-            headers={"Content-Type": "application/json", "User-Agent": APP_USER_AGENT}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                return resp.status == 200
-        except Exception:
+        if not callback_query_id:
             return False
-
-    def format_status_card(self):
-        uptime = datetime.now() - self.start_time
-        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-        minutes, seconds = divmod(remainder, 60)
-
-        ns_on = "🟢 开启" if self.source_states.get("nodeseek", True) else "🔴 暂停"
-        sb_on = "🟢 开启" if self.source_states.get("sbsb", True) else "🔴 暂停"
-
-        ai_status = "🟢 运行中" if self.ai_is_ready() else ("🟡 已停用" if self.ai_endpoint and self.ai_model and self.ai_api_key else "⚪ 未配置")
-        sb_checkin_info = "官方标记 + 每日签到" + (f" (UID: {self.sbsb_uid})" if self.sbsb_uid else "")
-        if not self.sbsb_cookie:
-            sb_checkin_info = "官方标记 (未配置 Cookie 签到)"
-
-        pause_label = "▶️ 恢复推送与参与" if self.paused else "⏸️ 暂停推送与参与"
-        pause_action = "resume" if self.paused else "pause"
-
-        kw_status = f"<b>{len(self.keywords)}</b> 个 (最高优先级直通)" if self.keywords else "未配置 (默认不启用)"
-
-        stats = dict(self.daily_stats)
-        scanned = stats.get("total_scanned", 0)
-        hits = stats.get("custom_hits", 0) + stats.get("lottery_hits", 0)
-        priv_notified = stats.get("private_notified", 0)
-
-        lines = [
-            "📊 <b>多社区监控实时守护状态</b>",
-            "",
-            f"⏱️ <b>连续运行</b>: {hours}小时 {minutes}分  |  🔔 <b>推送状态</b>: {'⏸️ 已暂停推送' if self.paused else '▶️ 正常推送中'}",
-            f"📡 <b>轮询频率</b>: 每 {self.poll_interval} 秒扫描双源",
-            "",
-            "🌐 <b>监控网站状态</b>",
-            f"• 🌐 <b>NodeSeek</b>: {ns_on} ({ai_status} AI 判定，待处理 {len(self.nodeseek_ai_pending)} 篇 / 待复核 {len(self.nodeseek_ai_review)} 篇)",
-            f"• 🍪 <b>烧饼论坛</b>: {sb_on} ({sb_checkin_info})",
-            f"• 🍪 <b>红包/抽奖自动参与</b>: {self.sbsb_participation_status()}",
-            "",
-            "🎯 <b>专属关注雷达</b>",
-            f"• 状态: {kw_status}",
-            "",
-            "📈 <b>今日活跃概览</b>",
-            f"• 扫描新帖: <b>{scanned}</b> 篇  |  今日累计命中: <b>{hits}</b> 篇",
-            f"• 烧饼私信提醒: <b>{priv_notified}</b> 次  |  去重索引库: <b>{len(self.seen_ids)}</b> 篇公开帖",
-        ]
-        participant = getattr(self, "participant", None)
-        if participant:
-            lines.append(f"• 自动参与预算: {html.escape(participant.summary())}")
-        text = "\n".join(lines)
-        markup = {
-            "inline_keyboard": [
-                [
-                    {"text": pause_label, "callback_data": f"menu:{pause_action}"},
-                    {"text": "📈 查看今日详细日报", "callback_data": "menu:report"},
-                ],
-                [
-                    {"text": "📡 网站开关", "callback_data": "menu:sources"},
-                    {"text": "🎯 关注词管理", "callback_data": "menu:keywords"},
-                ],
-            ]
-        }
-        return text, markup
-
-    def format_keywords_card(self):
-        with self.lock:
-            kws = list(self.keywords)
-        
-        if kws:
-            pills = " · ".join([f"<code>{k}</code>" for k in kws])
-            body = f"🎯 <b>生效中的专属关注词</b> ({len(kws)} 个 - <b>最高优先级直通</b>)\n{pills}"
-        else:
-            body = "<i>（当前未配置关注词，专属雷达处于不启用状态）</i>"
-
-        text = (
-            f"🎯 <b>专属关注雷达管理</b>\n\n"
-            f"{body}\n\n"
-            "<i>💡 说明：关键词拥有最高判定优先级。一旦帖子标题或内容包含关注词，将立即作为【自定义关注】直通推送给您，不再进入后续抽奖判定队列。</i>"
-        )
-        markup = {
-            "inline_keyboard": [
-                [
-                    {"text": "➕ 添加关注词", "callback_data": "menu:add_kw"},
-                    {"text": "🗑️ 点选删除", "callback_data": "menu:del_kw"}
-                ]
-            ]
-        }
-        return text, markup
-
-    def format_sources_card(self):
-        with self.lock:
-            lines = []
-            buttons = []
-            for s in self.sources:
-                sid = s["id"]
-                sname = s["name"]
-                sicon = s["icon"]
-                is_on = self.source_states.get(sid, True)
-                status_str = "🟢 开启推送中" if is_on else "🔴 已暂停推送"
-                lines.append(f"{sicon} <b>{sname}</b>: {status_str}")
-                btn_text = f"{sicon} {sname}推送: {'开启 🟢' if is_on else '关闭 🔴'}"
-                buttons.append([{"text": btn_text, "callback_data": f"toggle_src:{sid}"}])
-
-            if any(s["id"] == "sbsb" for s in self.sources):
-                lines.append(f"🍪 <b>红包/抽奖自动参与</b>: {self.sbsb_participation_status()}")
-                buttons.append([{"text": f"🍪 自动参与: {self.sbsb_participation_status()}",
-                                 "callback_data": "toggle_participation:sbsb"}])
-
-        body = "\n".join(lines)
-        text = (
-            "📡 <b>监控网站独立推送开关控制台</b>\n\n"
-            f"{body}\n\n"
-            "<i>💡 网站推送与自动参与分别控制。关闭烧饼推送仍可自动参与红包/抽奖；全局暂停会停止两者。每日签到保持原设置。</i>"
-        )
-        markup = {"inline_keyboard": buttons}
-        return text, markup
-
-    def generate_daily_report_card(self):
-        """生成每日运行统计与算法成功率报告卡片（总-分结构，无锁快照）"""
-        stats = dict(self.daily_stats)
-        scanned = stats.get("total_scanned", 0)
-        lottery_hits = stats.get("lottery_hits", 0)
-        custom_hits = stats.get("custom_hits", 0)
-        total_captured = custom_hits + lottery_hits
-        priv_notified = stats.get("private_notified", 0)
-        poll_success = stats.get("poll_success", 0)
-        poll_errors = stats.get("poll_errors", 0)
-        delivery_success = stats.get("delivery_success", 0)
-        delivery_errors = stats.get("delivery_errors", 0)
-        marker_poll_success = stats.get("marker_poll_success", 0)
-        marker_poll_errors = stats.get("marker_poll_errors", 0)
-        sbsb_lottery_events = stats.get("sbsb_lottery_events", 0)
-        sbsb_redpacket_events = stats.get("sbsb_redpacket_events", 0)
-        ai_requests = stats.get("ai_requests", 0)
-        ai_errors = stats.get("ai_errors", 0)
-        ai_classified = stats.get("ai_classified", 0)
-        ai_giveaway_hits = stats.get("ai_giveaway_hits", 0)
-        ai_second_reviews = stats.get("ai_second_reviews", 0)
-        ai_uncertain = stats.get("ai_uncertain", 0)
-
-        total_polls = poll_success + poll_errors
-        poll_rate = (poll_success / total_polls * 100) if total_polls > 0 else 100.0
-        total_deliv = delivery_success + delivery_errors
-        deliv_rate = (delivery_success / total_deliv * 100) if total_deliv > 0 else 100.0
-        date_str = stats.get("date", self.get_today_cst())
-
-        ns_is_on = "🟢 开启中" if self.source_states.get("nodeseek", True) else "🔴 已暂停"
-        sb_is_on = "🟢 开启中" if self.source_states.get("sbsb", True) else "🔴 已暂停"
-        sb_checkin_str = f"🟢 运行中" + (f" (UID: {self.sbsb_uid})" if self.sbsb_uid else "") if self.sbsb_cookie else "⚪ 未配置"
-
-        lines = [
-            "📈 <b>多社区监控每日运行与算法日报</b>",
-            f"📅 <b>统计日期</b>: <code>{date_str}</code> (周期: 24h)",
-            "",
-            "📊 <b>【总览】全网数据大盘</b>",
-            f"• 🌐 全网新发主题: <b>{scanned}</b> 篇",
-            f"• 🎁 累计捕获推送: <b>{total_captured}</b> 篇 (关注直通 {custom_hits} / 福利抽奖 {lottery_hits})",
-            f"• ✉️ Telegram 送达: <b>{delivery_success}</b> 成功 / <b>{delivery_errors}</b> 失败 (成功率 {deliv_rate:.1f}%)",
-            f"• 📡 采集巡检成功率: <b>{poll_rate:.1f}%</b> ({poll_success} 成功 / {poll_errors} 异常)",
-            "",
-            "🌐 <b>【NodeSeek】AI 语义驱动</b>",
-            f"• 📡 监控状态: {ns_is_on} (全站实时流)",
-            f"• 🧠 AI 判定总数: <b>{ai_classified}</b> 篇 (API 请求 {ai_requests} 次 / 异常 {ai_errors})",
-            f"• 待人工复核: <b>{len(self.nodeseek_ai_review)}</b> 篇",
-            f"• 🎯 判定结果分布: 抽奖命中 <b>{ai_giveaway_hits}</b> 篇 | 边界二审 <b>{ai_second_reviews}</b> 篇 | 存疑待审 <b>{ai_uncertain}</b> 篇",
-            "• 🤖 自动回帖参与: ⚪ 未启用",
-            "",
-            "🍪 <b>【烧饼论坛】官方标记与签到</b>",
-            f"• 📡 活动推送: {sb_is_on} (RSS 30s + 官方标记 5m)",
-            f"• 🎁 官方标记事件: 抽奖 <b>{sbsb_lottery_events}</b> 篇 | 红包 <b>{sbsb_redpacket_events}</b> 个 (巡检 {marker_poll_success} 次 / 异常 {marker_poll_errors})",
-            f"• 📬 私信与互动通知: <b>{priv_notified}</b> 次提醒",
-            f"• 🍪 每日自动签到: {sb_checkin_str}",
-        ]
-        lines.extend(["", "🤖 <b>【烧饼】红包与抽奖自动参与</b>",
-                      f"• 参与开关: {self.sbsb_participation_status()} (独立于活动推送)"])
-        if isinstance(self.participant.planner, ContentPlanner) and not self.participant.planner.key:
-            lines.append("• ⚠️ 安全筛查未配置，当前无法自动参与")
-        try:
-            participation = self.participant.ledger.daily_report(date_str)
-        except Exception:
-            lines.append("• ⚠️ 参与账本读取异常，统计暂不可用")
-        else:
-            for kind, label in (("redpacket", "红包"), ("lottery", "抽奖")):
-                counts = participation["groups"][kind]
-                lines.append(f"• 🎁 {label}: 自动提交确认 <b>{counts['submitted']}</b> 项 | 账号已参与 <b>{counts['account_joined']}</b> 项 | 结果待确认 <b>{counts['unconfirmed']}</b> 项")
-                lines.append(f"  跳过 {counts['skipped']} / 需人工处理 {counts['review']} / 待重试 {counts['retry']}")
-            lines.extend([
-                f"• ⏳ 当前随机等待: <b>{participation['waiting']}</b> 项",
-                f"• 🍪 当日保守预算占用: <b>{participation['reserved_cost']}/{self.participant.daily}</b> 饼 | 提交预留 <b>{participation['reserved_count']}</b> 次",
-                "• 口径: 当日账本按活动去重；账号已参与不归因于自动提交；参与不代表中奖或到账；预算占用并非实际扣饼。",
-            ])
-        return "\n".join(lines)
-
-
-def make_keyword_buttons(keywords, prefix="del_kw"):
-    buttons = []
-    row = []
-    for kw in keywords:
-        row.append({"text": f"❌ {kw}", "callback_data": f"{prefix}:{kw}"})
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([{"text": "🔙 返回关注词列表", "callback_data": f"{prefix}:__back__"}])
-    return {"inline_keyboard": buttons}
+        return self._telegram_call("answerCallbackQuery", {"callback_query_id": callback_query_id,
+                                   "text": tg_clip(tg_plain(text), 180), "show_alert": False})
 
 
 SBSB_CHECKIN_URL = "https://sb.sb/checkin/"
@@ -988,588 +747,159 @@ def run_sbsb_browser_checkin(cookie, cap_endpoint):
 
 
 def do_sbsb_signin(cookie, allow_submit=True):
-    """Sign in through the current official form; only confirmed state is success."""
+    """Return independent query, submission and optional-field evidence."""
+    observed_period = period_key(datetime.now(CST))
+    attempted, accepted = False, False
+    browser_in_progress = False
+    confirmation_recovered = False
+    browser_stage = None
+
+    def failure(outcome, code, *, stop=False):
+        messages = {
+            "not_configured": "未配置烧饼登录凭据",
+            "login_required": "论坛已将请求重定向到登录页",
+            "unsupported_form": "未找到可确认的官方签到表单，未提交",
+            "query_unavailable": "官方查询暂未完成",
+            "unsigned": "官方查询确认本轮尚未签到；本次没有提交",
+            "submission_unconfirmed": "程序已提交请求，但最终签到结果尚未确认",
+            "automation_stopped": "自动流程未完成，本轮停止自动提交，请查看论坛状态",
+        }
+        return {"success": False, "already": False, "outcome": outcome,
+                "period": observed_period, "error_code": code,
+                "needs_human": stop, "submission_attempted": attempted,
+                "submission_possible": browser_in_progress,
+                "browser_stage": browser_stage,
+                "submission_accepted": accepted, "msg": messages[outcome]}
+
     if not cookie:
-        return {"success": False, "msg": "未配置 SBSB_COOKIE，请先在 VPS 配置 Cookie"}
+        return failure("not_configured", "cookie_not_configured")
     if "=" not in cookie:
         cookie = f"__Host-bbs_session={cookie}"
-    headers = {
-        "User-Agent": APP_USER_AGENT,
-        "Cookie": cookie,
-        "Accept": "text/html,application/xhtml+xml",
-        "Referer": SBSB_CHECKIN_URL,
-        "Origin": "https://sb.sb",
-        "Cache-Control": "no-cache",
-    }
+    headers = {"User-Agent": APP_USER_AGENT, "Cookie": cookie,
+               "Accept": "text/html,application/xhtml+xml", "Referer": SBSB_CHECKIN_URL,
+               "Origin": "https://sb.sb", "Cache-Control": "no-cache"}
 
     class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             return None
 
+    class QueryError(Exception):
+        def __init__(self, code):
+            self.code = code
+
     opener = urllib.request.build_opener(NoRedirectHandler)
-    browser_failure = None
-    confirmation_recovered = False
 
     def read_response(req):
         try:
-            resp = opener.open(req, timeout=15)
+            response = opener.open(req, timeout=15)
         except urllib.error.HTTPError as exc:
-            resp = exc
-        with resp:
-            status = getattr(resp, "status", getattr(resp, "code", 200))
-            location = resp.headers.get("Location", "")
-            body = resp.read().decode("utf-8", errors="replace")
+            response = exc
+        with response:
+            status = getattr(response, "status", getattr(response, "code", 200))
+            location = response.headers.get("Location", "")
+            body = response.read(1500001)
+        if len(body) > 1500000:
+            raise QueryError("page_too_large")
         if location:
-            target = urllib.parse.urljoin(SBSB_CHECKIN_URL, location)
-            if target != SBSB_CHECKIN_URL:
-                raise ValueError("签到请求跳转到登录页或非签到地址，请检查 Cookie")
-        return status, body
+            target = urllib.parse.urljoin(req.full_url, location)
+            parts = urllib.parse.urlsplit(target)
+            if parts.scheme == "https" and parts.netloc == "sb.sb" and parts.path in ("/login", "/login/"):
+                raise QueryError("login_required")
+            if target != req.full_url:
+                raise QueryError("unexpected_redirect")
+        return status, body.decode("utf-8", errors="replace")
 
     try:
-        status, html_signin = read_response(urllib.request.Request(SBSB_CHECKIN_URL, headers=headers))
+        status, source = read_response(urllib.request.Request(SBSB_CHECKIN_URL, headers=headers))
+        observed_period = period_key(datetime.now(CST))
         if status != 200:
-            return {"success": False, "msg": f"访问官方签到页面失败 (HTTP {status})"}
-        page = SbsbSigninPageParser(html_signin)
-        already_signed = page.signed
-        if not already_signed:
+            return failure("query_unavailable", f"query_http_{status}")
+        page = SbsbSigninPageParser(source)
+        already = page.signed
+        if not already:
             if not allow_submit:
-                return {"success": False, "needs_human": True,
-                        "msg": "等待浏览器完成人机验证与签到；本次仅查询状态"}
+                return failure("unsigned", "query_only_unsigned")
             form = page.checkin_form()
             if not form or not form["csrf"]:
-                return {"success": False, "msg": "未找到官方签到表单或 CSRF，可能需要重新登录"}
+                return failure("unsupported_form", "checkin_form_unavailable", stop=True)
+            submission_period = observed_period
             if os.environ.get("SBSB_BROWSER_SIGNIN", "").lower() in ("1", "true", "yes"):
-                browser_result = run_sbsb_browser_checkin(cookie, page.cap_endpoint)
-                print(f"[{datetime.now()}] 🍪 浏览器签到阶段: {browser_result.get('browser_stage', 'unknown')}", flush=True)
-                if not browser_result.get("success"):
-                    if browser_result.get("submission_accepted") is not True:
-                        return browser_result
-                    browser_failure = browser_result
-                    already_signed = False
-                else:
-                    already_signed = browser_result.get("already", False)
+                # If the browser call itself aborts without returning evidence,
+                # conservatively retain the durable pre-call submission guard.
+                browser_in_progress = True
+                browser = run_sbsb_browser_checkin(cookie, page.cap_endpoint)
+                browser_in_progress = False
+                stage = browser.get("browser_stage", "unknown")
+                if not isinstance(stage, str) or not re.fullmatch(r"[A-Za-z_]{1,100}", stage):
+                    stage = "unknown"
+                browser_stage = stage
+                print(f"[{datetime.now()}] 🍪 浏览器签到阶段: {stage}", flush=True)
+                attempted = browser.get("submission_attempted") is True or stage.startswith("submitted_")
+                accepted = browser.get("submission_accepted") is True or (
+                    browser.get("success") is True and stage == "submitted_confirmed" and not browser.get("already"))
+                attempted = attempted or accepted
+                if not browser.get("success") and not accepted:
+                    return failure("submission_unconfirmed" if attempted else "automation_stopped", stage, stop=True)
+                confirmation_recovered = not browser.get("success") and accepted
+                already = browser.get("already") is True
             else:
-                post_headers = dict(headers)
-                post_headers["Content-Type"] = "application/x-www-form-urlencoded"
-                post_data = urllib.parse.urlencode({"_csrf": form["csrf"], "message": ""}).encode("utf-8")
-                post_status, _ = read_response(urllib.request.Request(
-                    SBSB_CHECKIN_URL, data=post_data, headers=post_headers,
-                ))
+                post_headers = dict(headers, **{"Content-Type": "application/x-www-form-urlencoded"})
+                data = urllib.parse.urlencode({"_csrf": form["csrf"], "message": ""}).encode("utf-8")
+                attempted = True
+                post_status, _ = read_response(urllib.request.Request(SBSB_CHECKIN_URL, data=data, headers=post_headers))
+                accepted = post_status in (302, 303)
                 if post_status not in (200, 302, 303):
-                    reason = "；页面包含人机验证，请在浏览器完成签到" if page.has_captcha else ""
-                    return {"success": False, "needs_human": page.has_captcha,
-                            "msg": f"官方签到提交未成功 (HTTP {post_status}){reason}"}
-            status, html_signin = read_response(urllib.request.Request(SBSB_CHECKIN_URL, headers=headers))
-            page = SbsbSigninPageParser(html_signin)
+                    return failure("submission_unconfirmed", f"submission_http_{post_status}", stop=True)
+            status, source = read_response(urllib.request.Request(SBSB_CHECKIN_URL, headers=headers))
+            observed_period = period_key(datetime.now(CST))
+            page = SbsbSigninPageParser(source)
             if status != 200 or not page.signed:
-                if browser_failure is not None:
-                    return browser_failure
-                reason = "页面要求人机验证，请在浏览器完成签到" if page.has_captcha else "官方页面仍未确认今日已签到"
-                return {"success": False, "needs_human": page.has_captcha, "msg": reason}
-            if browser_failure is not None:
-                confirmation_recovered = True
+                return failure("submission_unconfirmed", "official_confirmation_unavailable", stop=True)
+            # A day boundary or a response without acceptance cannot attribute this
+            # query to our submission, even if the account is now signed.
+            already = already or not accepted or observed_period != submission_period
+            if confirmation_recovered and not already:
                 print(f"[{datetime.now()}] 🍪 浏览器签到阶段: submitted_confirmed（官方只读查询补确认）", flush=True)
-    except Exception as exc:
-        if browser_failure is not None:
-            return browser_failure
-        # Do not expose request headers, form tokens or raw HTML in Telegram.
-        return {"success": False, "msg": f"访问官方签到页面异常 ({type(exc).__name__})"}
+    except QueryError as exc:
+        if exc.code == "login_required" and not attempted:
+            return failure("login_required", exc.code, stop=True)
+        return failure("submission_unconfirmed" if attempted or accepted or browser_in_progress else "query_unavailable", exc.code,
+                       stop=attempted or accepted or browser_in_progress)
+    except Exception:
+        return failure("submission_unconfirmed" if attempted or accepted or browser_in_progress else "query_unavailable",
+                       "confirmation_query_failed" if attempted or accepted or browser_in_progress else "official_query_failed",
+                       stop=attempted or accepted or browser_in_progress)
 
-    # Missing/zero counters after a confirmed sign-in are not fabricated as 0 or 1.
-    streak_days = f"{page.streak} 天" if page.streak is not None and page.streak > 0 else "暂未获取"
-    total_days = f"{page.total} 天" if page.total is not None and page.total > 0 else "暂未获取"
-    flash_msg = "今日已完成签到" if already_signed else "签到成功"
-    points = "暂未获取"
-    exp = "暂未获取"
-    level = "暂未获取"
-    signin_time_str = ""
-
+    result = {"success": True, "already": already, "period": observed_period,
+              "outcome": "query_confirmed" if already else "submitted_confirmed",
+              "confirmed_at": datetime.now(CST).isoformat(), "needs_human": False,
+              "submission_attempted": attempted, "submission_accepted": accepted,
+              "browser_stage": browser_stage,
+              "confirmation_recovered": confirmation_recovered and not already,
+              "msg": "本轮已签到（查询确认）" if already else "签到成功",
+              "consecutive_days": f"{page.streak} 天" if page.streak and page.streak > 0 else UNKNOWN,
+              "total_days": f"{page.total} 天" if page.total and page.total > 0 else UNKNOWN,
+              **dict.fromkeys(("total_points", "exp", "level", "signin_time"), UNKNOWN)}
     try:
-        req_points = urllib.request.Request("https://sb.sb/points/", headers=headers)
-        resp_points = opener.open(req_points, timeout=15)
-        html_points = resp_points.read().decode("utf-8", errors="ignore")
-
-        pts_match = re.search(r'可用烧饼</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>(\d+)</span>', html_points) or re.search(r'可用烧饼.*?(\d+)', html_points)
-        if pts_match:
-            points = f"{pts_match.group(1)} 饼"
-
-        exp_match = re.search(r'成长值</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>(\d+)</span>', html_points) or re.search(r'成长值.*?(\d+)', html_points)
-        if exp_match:
-            exp = exp_match.group(1)
-
-        lv_match = re.search(r'等级</span>\s*<span[^>]*class=\"[^\"]*value[^\"]*\"[^>]*>([^<]+)</span>', html_points) or re.search(r'等级.*?(Lv\.\d+[^<\n]+)', html_points)
-        if lv_match:
-            level = lv_match.group(1).strip()
-
-        # 匹配账本中的每日签到记录（兼容现代 HTML 省略 </td> 闭合标签的写法）
-        time_with_iso_m = re.search(r'<time[^>]*datetime=["\']([^"\']+)["\'][^>]*>([^<]+)</time>\s*(?:</td>\s*)?<td>\s*每日签到', html_points)
-        if time_with_iso_m:
-            iso_str = time_with_iso_m.group(1)
-            try:
-                dt_utc = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
-                dt_cst = dt_utc.astimezone(timezone(timedelta(hours=8)))
-                signin_time_str = dt_cst.strftime('%Y-%m-%d %H:%M:%S')
-            except Exception:
-                signin_time_str = time_with_iso_m.group(2).strip()
-        else:
-            time_plain_m = re.search(r'<time[^>]*>([^<]+)</time>\s*(?:</td>\s*)?<td>\s*每日签到', html_points)
-            if time_plain_m:
-                signin_time_str = time_plain_m.group(1).strip()
-    except Exception as pe:
-        print(f"[{datetime.now()}] 访问 points 页面异常: {pe}", flush=True)
-
-    # A past ledger entry must not be presented as today's confirmed sign-in time.
-    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-    if not signin_time_str.startswith(today):
-        signin_time_str = "暂未获取"
-
-    return {
-        "success": True,
-        "already": already_signed,
-        "confirmation_recovered": confirmation_recovered,
-        "msg": flash_msg,
-        "consecutive_days": streak_days,
-        "total_days": total_days,
-        "total_points": points,
-        "exp": exp,
-        "level": level,
-        "signin_time": signin_time_str
-    }
+        status, points = read_response(urllib.request.Request("https://sb.sb/points/", headers=headers))
+        if status == 200:
+            result.update(PointsParser(points).values(observed_period))
+    except Exception:
+        pass  # An optional asset query cannot negate confirmed business success.
+    return result
 
 
 def handle_callback_query(bot, query):
-    query_id = query.get("id")
-    from_user = str(query.get("from", {}).get("id", ""))
-    msg = query.get("message", {})
-    chat_id = msg.get("chat", {}).get("id")
-    msg_id = msg.get("message_id")
-    data = query.get("data", "")
-
-    if from_user != bot.admin_chat_id:
-        bot.answer_callback_query(query_id, "⚠️ 无权操作此机器人。")
-        return
-
-    if data.startswith("toggle_src:"):
-        target_src = data.split("toggle_src:", 1)[1]
-        new_state = bot.toggle_source(target_src)
-        state_text = "开启 🟢" if new_state else "关闭 🔴"
-        bot.answer_callback_query(query_id, f"已切换为: {state_text}")
-        text, markup = bot.format_sources_card()
-        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-
-    elif data == "toggle_participation:sbsb":
-        if not bot.participant.enabled:
-            bot.answer_callback_query(query_id, "自动参与服务尚未启用")
-            return
-        new_state = bot.toggle_sbsb_participation()
-        note = "（全局暂停中，恢复后生效）" if new_state and bot.paused else ""
-        bot.answer_callback_query(query_id, f"自动参与已{'开启' if new_state else '关闭'}{note}")
-        text, markup = bot.format_sources_card()
-        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-
-    elif data == "menu:pause":
-        with bot.lock:
-            bot.paused = True
-            bot.save_settings()
-        bot.answer_callback_query(query_id, "⏸️ 已暂停推送和活动参与")
-        text, markup = bot.format_status_card()
-        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-
-    elif data == "menu:resume":
-        with bot.lock:
-            bot.paused = False
-            bot.save_settings()
-        bot.answer_callback_query(query_id, "▶️ 已恢复推送和活动参与")
-        text, markup = bot.format_status_card()
-        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-
-    elif data == "menu:report":
-        bot.answer_callback_query(query_id, "正在获取今日日报")
-        report_text = bot.generate_daily_report_card()
-        bot.send_msg(chat_id, report_text)
-
-    elif data == "menu:sources":
-        bot.answer_callback_query(query_id, "切换到监控源设置")
-        text, markup = bot.format_sources_card()
-        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-
-    elif data == "menu:keywords":
-        bot.answer_callback_query(query_id, "切换到关注词管理")
-        text, markup = bot.format_keywords_card()
-        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-
-    elif data == "menu:status":
-        bot.answer_callback_query(query_id, "返回状态面板")
-        text, markup = bot.format_status_card()
-        bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-
-    elif data == "ai:set_endpoint":
-        if bot.env_ai_endpoint:
-            bot.answer_callback_query(query_id, "已由环境变量锁定")
-            bot.send_msg(
-                chat_id,
-                f"🔒 <b>API 地址已由系统环境变量 <code>AI_ENDPOINT</code> 锁定：</b>\n"
-                f"<code>{html.escape(bot.env_ai_endpoint)}</code>\n\n"
-                f"如需更改，请直接修改服务器 <code>.env</code> 文件并重启容器。"
-            )
-        else:
-            bot.user_states[chat_id] = "waiting_for_ai_endpoint"
-            bot.answer_callback_query(query_id, "请发送 API 地址")
-            bot.send_msg(
-                chat_id,
-                "🔌 <b>请输入 OpenAI-compatible API 地址</b>\n"
-                "例如：<code>https://api.openai.com/v1</code>\n"
-                "也可以直接填写完整的 <code>/chat/completions</code> 地址。\n\n"
-                "<i>💡 推荐直接在 .env 文件中设置 <code>AI_ENDPOINT</code></i>",
-            )
-
-    elif data == "ai:set_key":
-        if bot.env_ai_api_key:
-            bot.answer_callback_query(query_id, "Key 已由环境变量锁定")
-            bot.send_msg(
-                chat_id,
-                "🔒 <b>API Key 已由系统环境变量 <code>AI_API_KEY</code> 注入锁定</b>\n\n"
-                "零对话框泄露风险。如需更换，请直接修改服务器 <code>.env</code> 文件并重启容器。"
-            )
-        else:
-            bot.user_states[chat_id] = "waiting_for_ai_key"
-            bot.answer_callback_query(query_id, "请发送 API Key")
-            bot.send_msg(
-                chat_id,
-                "🔑 <b>请输入 API Key</b>\n\n"
-                "<i>💡 最佳实践：推荐直接在服务器 <code>.env</code> 中配置 <code>AI_API_KEY</code>，完全无需在对话框输入。\n"
-                "若在此处发送，Bot 接收后会<b>立即自动删除你的原消息</b>以防留下聊天记录。</i>",
-            )
-
-    elif data == "ai:set_model":
-        if bot.env_ai_model:
-            bot.answer_callback_query(query_id, "模型已由环境变量锁定")
-            bot.send_msg(
-                chat_id,
-                f"🔒 <b>主模型已由环境变量 <code>AI_MODEL</code> 锁定：</b>\n"
-                f"<code>{html.escape(bot.env_ai_model)}</code>\n\n"
-                f"如需更改，请直接修改服务器 <code>.env</code> 文件并重启容器。"
-            )
-        else:
-            bot.user_states[chat_id] = "waiting_for_ai_model"
-            bot.answer_callback_query(query_id, "请发送模型名")
-            bot.send_msg(chat_id, "🤖 <b>请输入主模型名称</b>\n例如：<code>gpt-4o-mini</code> 或 <code>deepseek-chat</code>\n\n<i>💡 推荐直接在 .env 中设置 <code>AI_MODEL</code></i>")
-
-    elif data == "ai:set_judge":
-        bot.user_states[chat_id] = "waiting_for_ai_judge"
-        bot.answer_callback_query(query_id, "请发送复审模型名")
-        bot.send_msg(chat_id, "⚖️ <b>请输入复审模型名称</b>\n发送 <code>-</code> 可改为跟随主模型。")
-
-    elif data == "ai:set_threshold":
-        bot.user_states[chat_id] = "waiting_for_ai_threshold"
-        bot.answer_callback_query(query_id, "请发送阈值")
-        bot.send_msg(chat_id, "🎚️ <b>请输入自动通过阈值</b>\n允许范围 <code>0.70～0.99</code>，建议 <code>0.90</code>。")
-
-    elif data == "ai:toggle":
-        if not (bot.ai_endpoint and bot.ai_model and bot.ai_api_key):
-            bot.answer_callback_query(query_id, "请先完成 API、Key 和模型配置")
-            bot.send_msg(chat_id, "⚠️ <b>AI 配置尚未完成，无法启用。</b>")
-        else:
-            bot.ai_enabled = not bot.ai_enabled
-            if bot.ai_enabled:
-                for record in bot.nodeseek_ai_pending.values():
-                    record["next_retry_at"] = 0
-            bot.save_settings()
-            bot.save_nodeseek_ai_state()
-            bot.answer_callback_query(query_id, "AI 已启用" if bot.ai_enabled else "AI 已停用")
-            text_card, markup = bot.format_ai_card()
-            bot.edit_msg_text(chat_id, msg_id, text_card, reply_markup=markup)
-
-    elif data == "ai:test":
-        if not (bot.ai_endpoint and bot.ai_model and bot.ai_api_key):
-            bot.answer_callback_query(query_id, "请先完成配置")
-            bot.send_msg(chat_id, "⚠️ <b>请先设置 API 地址、API Key 和主模型。</b>")
-        else:
-            bot.answer_callback_query(query_id, "正在测试连接")
-            bot.send_msg(chat_id, "⏳ <b>正在调用模型进行结构化判定测试...</b>")
-            try:
-                facts = bot.test_ai_connection()
-                bot.send_msg(
-                    chat_id,
-                    "✅ <b>AI 连接和 JSON 输出验证成功</b>\n"
-                    f"模型识别状态：<code>{facts['event_state']}</code>\n"
-                    f"置信度：<code>{facts['confidence']:.2f}</code>",
-                )
-            except (AIClassificationError, ValueError) as exc:
-                bot.send_msg(chat_id, f"❌ <b>AI 测试失败</b>\n<code>{html.escape(str(exc))}</code>")
-
-    elif data == "menu:add_kw":
-        bot.user_states[chat_id] = "waiting_for_add"
-        bot.answer_callback_query(query_id, "请直接输入新关注词")
-        bot.send_msg(chat_id, "➕ <b>请输入你想添加的专属关注词：</b>\n<i>（支持一次输入多个词，用空格分隔，例如：<code>DMIT 搬瓦工 9929 传家宝</code>）</i>\n\n💡 <i>提示：添加后立即生效并享有最高推送优先级！</i>")
-
-    elif data == "menu:del_kw":
-        bot.answer_callback_query(query_id, "请点击按钮删除")
-        with bot.lock:
-            kws = list(bot.keywords)
-        if not kws:
-            bot.edit_msg_text(chat_id, msg_id, "⚠️ <b>当前没有已添加的自定义关注词。</b>")
-        else:
-            text = f"🗑️ <b>请点击下方按钮删除对应的关注词（共 {len(kws)} 个）：</b>"
-            bot.edit_msg_text(chat_id, msg_id, text, reply_markup=make_keyword_buttons(kws, "del_kw"))
-
-    elif data.startswith("del_kw:"):
-        target_kw = data.split("del_kw:", 1)[1]
-        if target_kw == "__back__":
-            bot.answer_callback_query(query_id, "返回")
-            text, markup = bot.format_keywords_card()
-            bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-            return
-        
-        with bot.lock:
-            if target_kw in bot.keywords:
-                bot.keywords.remove(target_kw)
-                bot.save_settings()
-                bot.answer_callback_query(query_id, f"已删除: {target_kw}")
-            else:
-                bot.answer_callback_query(query_id, "该词已不存在")
-        
-        with bot.lock:
-            kws = list(bot.keywords)
-        if not kws:
-            text, markup = bot.format_keywords_card()
-            bot.edit_msg_text(chat_id, msg_id, text, reply_markup=markup)
-        else:
-            text = f"🗑️ <b>请点击下方按钮删除对应的关注词（剩余 {len(kws)} 个）：</b>"
-            bot.edit_msg_text(chat_id, msg_id, text, reply_markup=make_keyword_buttons(kws, "del_kw"))
+    bot.handle_callback(query)
 
 
 def handle_command_or_text(bot, chat_id, text, message_id=None):
-    text = text.strip()
-
-    if chat_id in bot.user_states and not text.startswith("/"):
-        state = bot.user_states.pop(chat_id)
-        if state == "waiting_for_ai_endpoint":
-            if bot.env_ai_endpoint:
-                bot.send_msg(chat_id, "🔒 <b>API 地址已由环境变量 <code>AI_ENDPOINT</code> 锁定。</b>")
-                return
-            try:
-                normalize_chat_endpoint(text)
-                bot.ai_endpoint = text.strip().rstrip("/")
-                bot.save_settings()
-                for record in bot.nodeseek_ai_pending.values():
-                    record["next_retry_at"] = 0
-                bot.save_nodeseek_ai_state()
-                msg_text, markup = bot.format_ai_card()
-                bot.send_msg(chat_id, f"✅ <b>API 地址已保存</b>\n\n{msg_text}", reply_markup=markup)
-            except ValueError as exc:
-                bot.send_msg(chat_id, f"❌ <b>API 地址无效</b>\n<code>{html.escape(str(exc))}</code>")
-            return
-
-        if state == "waiting_for_ai_key":
-            if message_id:
-                bot.delete_msg(chat_id, message_id)
-            if bot.env_ai_api_key:
-                bot.send_msg(
-                    chat_id,
-                    "🔒 <b>API Key 已由系统环境变量锁定，无需在对话框中设置（包含密钥的原消息已自动销毁）。</b>"
-                )
-                return
-            api_key = text.strip()
-            if not api_key or len(api_key) > 1000:
-                bot.send_msg(chat_id, "❌ <b>API Key 不能为空或过长。</b>")
-            else:
-                bot.save_ai_secret(api_key)
-                for record in bot.nodeseek_ai_pending.values():
-                    record["next_retry_at"] = 0
-                bot.save_nodeseek_ai_state()
-                msg_text, markup = bot.format_ai_card()
-                bot.send_msg(chat_id, f"✅ <b>API Key 已安全保存（包含密钥的消息已自动销毁）</b>\n\n{msg_text}", reply_markup=markup)
-            return
-
-        if state == "waiting_for_ai_model":
-            if bot.env_ai_model:
-                bot.send_msg(chat_id, "🔒 <b>主模型已由环境变量 <code>AI_MODEL</code> 锁定。</b>")
-                return
-            model = text.strip()
-            if not model or len(model) > 200 or any(ch.isspace() for ch in model):
-                bot.send_msg(chat_id, "❌ <b>模型名无效，模型名不能包含空格。</b>")
-            else:
-                bot.ai_model = model
-                bot.save_settings()
-                for record in bot.nodeseek_ai_pending.values():
-                    record["next_retry_at"] = 0
-                bot.save_nodeseek_ai_state()
-                msg_text, markup = bot.format_ai_card()
-                bot.send_msg(chat_id, f"✅ <b>主模型已保存</b>\n\n{msg_text}", reply_markup=markup)
-            return
-
-        if state == "waiting_for_ai_judge":
-            model = "" if text.strip() == "-" else text.strip()
-            if len(model) > 200 or any(ch.isspace() for ch in model):
-                bot.send_msg(chat_id, "❌ <b>复审模型名无效，模型名不能包含空格。</b>")
-            else:
-                bot.ai_judge_model = model
-                bot.save_settings()
-                msg_text, markup = bot.format_ai_card()
-                bot.send_msg(chat_id, f"✅ <b>复审模型已保存</b>\n\n{msg_text}", reply_markup=markup)
-            return
-
-        if state == "waiting_for_ai_threshold":
-            try:
-                threshold = float(text.strip())
-                if not 0.70 <= threshold <= 0.99:
-                    raise ValueError
-                bot.ai_accept_threshold = threshold
-                bot.save_settings()
-                msg_text, markup = bot.format_ai_card()
-                bot.send_msg(chat_id, f"✅ <b>自动通过阈值已设为 {threshold:.2f}</b>\n\n{msg_text}", reply_markup=markup)
-            except ValueError:
-                bot.send_msg(chat_id, "❌ <b>阈值无效，请输入 0.70 到 0.99 之间的数字。</b>")
-            return
-
-        if state == "waiting_for_add":
-            new_kws = [k for k in text.split() if k not in LEGACY_BUILTIN_WORDS]
-            added = []
-            with bot.lock:
-                for kw in new_kws:
-                    if kw not in bot.keywords:
-                        bot.keywords.append(kw)
-                        added.append(kw)
-                bot.save_settings()
-            
-            text_card, markup = bot.format_keywords_card()
-            if added:
-                bot.send_msg(chat_id, f"✅ <b>已成功添加关注词 (最高优先级)</b>: <code>{', '.join(added)}</code>\n\n{text_card}", reply_markup=markup)
-            else:
-                bot.send_msg(chat_id, f"⚠️ <b>未添加新关注词</b>（可能词汇已存在）。\n\n{text_card}", reply_markup=markup)
-            return
-
-    parts = text.split(maxsplit=1)
-    cmd = parts[0].lower()
-    if "@" in cmd:
-        cmd = cmd.split("@")[0]
-    arg = parts[1] if len(parts) > 1 else ""
-
     try:
-        if cmd in ["/start", "/help"]:
-            help_text = (
-                "🤖 <b>多社区监控守护机器人使用指南</b>\n\n"
-                "<b>核心指令菜单 (4大核心功能)</b>:\n"
-                "├ /status - 📊 <b>监控状态与控制台</b>（含暂停/恢复、日报查看）\n"
-                "├ /keywords - 🎯 <b>自定义关注雷达</b>（最高优先级直通推送）\n"
-                "├ /sources - 📡 <b>各网站独立开关管理</b>\n"
-                "└ /signin - 🍪 <b>烧饼论坛一键签到与查分</b>\n\n"
-                "💡 <i>NodeSeek 抽奖由 AI 双阶段语义模型自动判定，烧饼论坛抽奖/红包由官方徽标驱动。</i>"
-            )
-            bot.send_msg(chat_id, help_text)
-
-        elif cmd in ["/status", "/stats"]:
-            text_card, markup = bot.format_status_card()
-            bot.send_msg(chat_id, text_card, reply_markup=markup)
-
-        elif cmd == "/report":
-            report_text = bot.generate_daily_report_card()
-            bot.send_msg(chat_id, report_text)
-
-        elif cmd == "/sources":
-            text_card, markup = bot.format_sources_card()
-            bot.send_msg(chat_id, text_card, reply_markup=markup)
-
-        elif cmd == "/ai":
-            text_card, markup = bot.format_ai_card()
-            bot.send_msg(chat_id, text_card, reply_markup=markup)
-
-        elif cmd in ["/signin", "/checkin"]:
-            bot.send_msg(chat_id, "⏳ <b>正在连接烧饼论坛执行签到与资产同步...</b>")
-            res = do_sbsb_signin(bot.sbsb_cookie)
-            if res.get("success"):
-                # 手动签到成功，同步更新本地签到状态记录
-                today_str = bot.get_today_cst()
-                try:
-                    os.makedirs(DATA_DIR, exist_ok=True)
-                    with open(CHECKIN_STATE_FILE, "w", encoding="utf-8") as f:
-                        json.dump({"last_date": today_str}, f, ensure_ascii=False)
-                except Exception:
-                    pass
-
-                status_badge = "✅ 签到成功！" if not res.get("already") else "✨ 今日已完成签到"
-                report_msg = (
-                    f"🍪 <b>烧饼论坛 (sb.sb) 签到与资产报告</b>\n\n"
-                    f"🎉 <b>签到状态</b>: {status_badge}\n"
-                    f"📅 <b>连续签到</b>: <b>{res.get('consecutive_days')}</b> (累计: {res.get('total_days')})\n"
-                    f"💰 <b>可用烧饼</b>: <b>{res.get('total_points')}</b>\n"
-                    f"⭐ <b>成长等级</b>: <b>{res.get('level')}</b> (成长值: {res.get('exp')})\n"
-                    f"🕒 <b>签到时间</b>: {res.get('signin_time')}\n\n"
-                    "<i>💡 系统将在每日 08:05 (UTC+8) 自动执行定时签到</i>"
-                )
-                bot.send_msg(chat_id, report_msg)
-            else:
-                bot.send_msg(chat_id, f"⚠️ <b>烧饼论坛签到失败</b>\n原因: <code>{res.get('msg')}</code>")
-
-        elif cmd in ["/keywords", "/list", "/add", "/del"]:
-            if cmd == "/add" and arg:
-                new_kws = [k for k in arg.split() if k not in LEGACY_BUILTIN_WORDS]
-                added = []
-                with bot.lock:
-                    for kw in new_kws:
-                        if kw not in bot.keywords:
-                            bot.keywords.append(kw)
-                            added.append(kw)
-                    bot.save_settings()
-                text_card, markup = bot.format_keywords_card()
-                bot.send_msg(chat_id, f"✅ 已添加关注词：<code>{', '.join(added)}</code>\n\n{text_card}", reply_markup=markup)
-                return
-            
-            text_card, markup = bot.format_keywords_card()
-            bot.send_msg(chat_id, text_card, reply_markup=markup)
-
-        elif cmd == "/pause":
-            with bot.lock:
-                bot.paused = True
-                bot.save_settings()
-            bot.send_msg(chat_id, "⏸️ <b>推送和红包/抽奖自动参与已暂停。</b>\n后台继续记录通知去重索引；每日签到保持原设置。发送 /resume 恢复。")
-
-        elif cmd == "/resume":
-            with bot.lock:
-                bot.paused = False
-                bot.save_settings()
-            bot.send_msg(chat_id, "▶️ <b>推送和红包/抽奖自动参与已恢复。</b>")
-
-        elif cmd == "/test":
-            test_msg_ns_lottery = (
-                "🎁 <b>🌐 [NodeSeek] 发现抽奖新帖！</b> (演示卡片)\n\n"
-                "📌 <b>标题</b>: [日常] 回帖抽奖演示贴（随机抽取 3 台 VPS）\n"
-                "👤 <b>作者</b>: NodeSeeker  |  🏷️ <b>板块</b>: #daily\n"
-                "📝 <b>摘要</b>: 这是一条手动触发的 NodeSeek 抽奖测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
-                "🔗 <b>链接</b>: https://www.nodeseek.com/post-889000-1"
-            )
-            test_msg_ns_welfare = (
-                "🎉 <b>🌐 [NodeSeek] 发现福利新帖！</b> (演示卡片)\n\n"
-                "📌 <b>标题</b>: [日常] 免费赠送欧洲小鸡/激活码（先到先得）\n"
-                "👤 <b>作者</b>: NodeSeeker  |  🏷️ <b>板块</b>: #daily\n"
-                "📝 <b>摘要</b>: 这是一条手动触发的 NodeSeek 福利/赠送测试卡片，格式与直达 HTTP 链接已配置完毕。\n\n"
-                "🔗 <b>链接</b>: https://www.nodeseek.com/post-889001-1"
-            )
-            test_msg_sb = (
-                "🎁 <b>🍪 [烧饼论坛] 发现抽奖/福利新帖！</b> (演示卡片)\n\n"
-                "📌 <b>标题</b>: 〖抽奖〗新人见面礼｜抽 10 台 LAXPre Nano，65 折循环续费\n"
-                "👤 <b>作者</b>: 烧饼用户  |  🏷️ <b>板块</b>: #优惠\n"
-                "📝 <b>摘要</b>: 这是一条手动触发的烧饼论坛测试卡片，官方抽奖与红包标记已接入监控。\n\n"
-                "🔗 <b>链接</b>: https://sb.sb/t/931/"
-            )
-            test_msg_kw = (
-                "🎯 <b>🌐 [NodeSeek] 发现专属关注新帖！</b> (演示卡片)\n\n"
-                "📌 <b>标题</b>: DMIT LAX Pro 机器补货通知与深度评测\n"
-                "👤 <b>作者</b>: VPS_Master  |  🏷️ <b>板块</b>: #vps\n"
-                "📝 <b>摘要</b>: 命中您的专属关注词 [DMIT]，最高优先级直通推送。\n\n"
-                "🔗 <b>链接</b>: https://www.nodeseek.com/post-999999-1"
-            )
-            bot.send_msg(chat_id, test_msg_ns_lottery, disable_preview=False)
-            bot.send_msg(chat_id, test_msg_ns_welfare, disable_preview=False)
-            bot.send_msg(chat_id, test_msg_sb, disable_preview=False)
-            bot.send_msg(chat_id, test_msg_kw, disable_preview=False)
-        
-        else:
-            bot.send_msg(chat_id, f"❓ 未识别的指令：<code>{cmd}</code>\n请输入 /help 查看可用指令列表。")
-    except Exception as ie:
-        print(f"[{datetime.now()}] ❌ 执行指令 {cmd} 发生内部异常: {ie}", flush=True)
-        traceback.print_exc()
+        bot.handle_command(chat_id, text, message_id, normalize_chat_endpoint, LEGACY_BUILTIN_WORDS)
+    except Exception as exc:
+        # User input, API endpoints and exceptions may contain credentials.
+        print(f"[{datetime.now()}] 指令处理未完成: {type(exc).__name__}", flush=True)
+        bot.send_msg(chat_id, "⚠️ 操作未完成，请重新查询当前状态。")
 
 
 def telegram_polling_thread(bot):
@@ -1715,6 +1045,9 @@ def fetch_sbsb_topic_page(path="/", cookie=""):
 
 
 def deliver_public_match(bot, source_name, source_icon, category, title, author, desc, link, hit_type, hit_reason):
+    sid = {"NodeSeek": "nodeseek", "烧饼论坛": "sbsb"}.get(source_name)
+    if getattr(bot, "paused", False) or (sid and not getattr(bot, "source_states", {}).get(sid, True)):
+        return False
     bot.total_hit += 1
     hit_badges = {
         "lottery": "🎁 [抽奖]",
@@ -1725,16 +1058,8 @@ def deliver_public_match(bot, source_name, source_icon, category, title, author,
     hit_badge = hit_badges.get(hit_type, "🎁 [抽奖/福利]")
     print(f"[{datetime.now()}] {hit_badge} 命中: [{source_name}] [{category}] {title} ({hit_reason})", flush=True)
 
-    summary = desc[:140] + ("..." if len(desc) > 140 else "")
-    event_name = {"lottery": "抽奖", "welfare": "福利", "redpacket": "红包", "custom": "专属关注"}.get(hit_type, "抽奖/福利")
-    msg = (
-        f"{hit_badge.split()[0]} <b>{source_icon} [{source_name}] 发现{event_name}新帖！</b>\n\n"
-        f"📌 <b>标题</b>: {title}\n"
-        f"👤 <b>作者</b>: {author}  |  🏷️ <b>板块</b>: #{category}\n"
-        f"📝 <b>摘要</b>: {summary}\n\n"
-        f"🔗 <b>链接</b>: {link}"
-    )
-    delivered = bot.send_msg(bot.admin_chat_id, msg, disable_preview=False)
+    msg, markup = format_activity(source_name, hit_type, title, author, category, desc, link, hit_reason)
+    delivered = bot.send_msg(bot.admin_chat_id, msg, reply_markup=markup)
     bot.record_stat("delivery_success" if delivered else "delivery_errors")
     if not delivered:
         print(f"[{datetime.now()}] ❌ Telegram 推送失败: [{source_name}] {title}", flush=True)
@@ -1869,80 +1194,97 @@ def process_nodeseek_ai_queue(bot):
         )
 
 
+def execute_sbsb_signin(bot, chat_id=None, *, allow_submit=False, automatic=False):
+    """Serialize scheduler/manual work and commit business evidence before notice.
+
+    A failed notice never makes a completed sign-in eligible for another POST.
+    Old completion-only files are upgraded by a GET, without trusting their
+    ambiguous midnight date or generating a duplicate success notification.
+    """
+    target = chat_id if chat_id is not None else bot.admin_chat_id
+    store = SigninStore(CHECKIN_STATE_FILE)
+    try:
+        with store.locked() as state:
+            now = datetime.now(CST)
+            key = period_key(now)
+            completed = signin_confirmed(state, key)
+            if automatic and (completed or not sbsb_checkin_due(now, "")):
+                return None
+            legacy = "version" not in state and bool(state.get("last_date"))
+            legacy_last_date = state.get("last_date") if legacy else None
+            can_submit = allow_submit and not completed and not signin_blocked(state, key)
+            guard = state.get("submission_guard", {})
+            if guard.get("period") == key:
+                # A process may have exited after a POST but before confirmation.
+                # Recover by GET only, never by repeating that uncertain POST.
+                can_submit = False
+                state["blocked_period"] = state["manual_required_date"] = key
+            if legacy:
+                can_submit = False
+            if can_submit:
+                state["submission_guard"] = {"period": key, "started_at": now.isoformat()}
+                store.save(state)
+            result = do_sbsb_signin(bot.sbsb_cookie, allow_submit=can_submit)
+            now = datetime.now(CST)
+            state = record_signin_result(state, result, now)
+            if result.get("success") or not any(result.get(k) for k in (
+                    "submission_attempted", "submission_possible", "submission_accepted")):
+                # Only this call's guard can be cleared by evidence of no POST.
+                # A read-only recovery cannot clear a previous uncertain attempt.
+                if can_submit or result.get("success"):
+                    state.pop("submission_guard", None)
+            # The caller may have crossed 08:00. Only the period confirmed by the
+            # official read is completed; a previous period cannot skip the new one.
+            result_period = result.get("period") or key
+            store.save(state)
+            text, markup = format_signin(result, state, now, automatic=automatic)
+            kind = "success" if result.get("success") else "warning"
+            previous_notice = state.get("notice", {})
+            signature = kind + ":" + state["last_query"]["outcome"] + (":blocked" if signin_blocked(state, result_period) else "")
+            notify = not automatic or (
+                previous_notice.get("period") != result_period or previous_notice.get("signature") != signature)
+            if automatic and legacy and result.get("success") and legacy_last_date == result_period:
+                # Existing deployments already emitted their daily card. There
+                # is no acknowledgement evidence, so do not label it accepted.
+                state["notice"] = {"period": result_period, "kind": kind, "status": "legacy_unknown", "signature": signature}
+                store.save(state)
+                notify = False
+            if notify:
+                state["notice"] = {"period": result_period, "kind": kind, "status": "pending",
+                                   "attempted_at": now.isoformat(), "signature": signature}
+                if kind == "warning":
+                    state["last_error_date"] = result_period
+                store.save(state)
+                sent = bot.send_msg(target, text, reply_markup=markup)
+                state["notice"]["status"] = "accepted" if sent is True else "unconfirmed"
+                store.save(state)
+            if automatic:
+                outcome = "提交成功" if result.get("success") and not result.get("already") else (
+                    "查询确认" if result.get("success") else result.get("outcome", "query_unavailable"))
+                notice = state.get("notice", {}).get("status", "not_requested")
+                code = result.get("error_code", "")
+                print(f"[{datetime.now()}] 🍪 烧饼签到 {outcome}；安全码: {code or 'none'}；通知接口状态: {notice}", flush=True)
+            return result
+    except StateError:
+        print(f"[{datetime.now()}] 签到状态读取异常，未提交", flush=True)
+        if not automatic:
+            bot.send_msg(target, "⚠️ 签到记录读取异常，未执行自动提交；请先核对记录。")
+        return {"success": False, "outcome": "state_unavailable"}
+
+
 def sbsb_checkin_due(now_cst, last_date):
-    return (last_date != now_cst.strftime("%Y-%m-%d")
-            and (now_cst.hour, now_cst.minute) >= (8, 5))
+    return signin_due(now_cst, last_date)
 
 
 def sbsb_checkin_scheduler_thread(bot):
-    """烧饼论坛每日自动签到调度线程 (北京时间每天 08:05 执行)"""
     if not bot.sbsb_cookie:
         return
-
-    print(f"[{datetime.now()}] ⏰ 烧饼论坛每日自动签到调度器已就绪 (目标时间: 北京时间 08:05)...", flush=True)
-
-    def get_checkin_state():
-        if os.path.exists(CHECKIN_STATE_FILE):
-            try:
-                with open(CHECKIN_STATE_FILE, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                    return state if isinstance(state, dict) else {}
-            except Exception:
-                return {}
-        return {}
-
-    def save_checkin_state(state):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        temp_path = CHECKIN_STATE_FILE + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
-        os.replace(temp_path, CHECKIN_STATE_FILE)
-
+    print(f"[{datetime.now()}] ⏰ 烧饼签到调度器已就绪（北京时间08:05）", flush=True)
     while True:
         try:
-            tz_cst = timezone(timedelta(hours=8))
-            now_cst = datetime.now(tz_cst)
-            today_str = now_cst.strftime("%Y-%m-%d")
-            state = get_checkin_state()
-            last_date = state.get("last_date", "")
-
-            if sbsb_checkin_due(now_cst, last_date):
-                print(f"[{datetime.now()}] 🎯 触发烧饼论坛每日自动签到流水线...", flush=True)
-                res = do_sbsb_signin(
-                    bot.sbsb_cookie, allow_submit=state.get("manual_required_date") != today_str,
-                )
-                if res.get("success"):
-                    save_checkin_state({"last_date": today_str})
-                    status_badge = "✅ 自动签到成功！" if not res.get("already") else "✨ 今日已签到（查询确认）"
-                    report_msg = (
-                        f"🍪 <b>烧饼论坛 (sb.sb) 每日自动签到报告</b>\n\n"
-                        f"🎉 <b>签到状态</b>: {status_badge}\n"
-                        f"📅 <b>连续签到</b>: <b>{res.get('consecutive_days')}</b> (累计: {res.get('total_days')})\n"
-                        f"💰 <b>可用烧饼</b>: <b>{res.get('total_points')}</b>\n"
-                        f"⭐ <b>成长等级</b>: <b>{res.get('level')}</b> (成长值: {res.get('exp')})\n"
-                        f"🕒 <b>签到时间</b>: {res.get('signin_time')}\n\n"
-                        "<i>💡 每日 08:05 (UTC+8) 定时自动执行</i>"
-                    )
-                    bot.send_msg(bot.admin_chat_id, report_msg)
-                    outcome = "提交成功" if not res.get("already") else "查询确认"
-                    print(f"[{datetime.now()}] ✅ 烧饼签到 {outcome}，通知调用完成（连续: {res.get('consecutive_days')}，累计: {res.get('total_days')}）。", flush=True)
-                else:
-                    print(f"[{datetime.now()}] ⚠️ 自动签到未能成功: {res.get('msg')}", flush=True)
-                    if res.get("needs_human"):
-                        state["manual_required_date"] = today_str
-                    if state.get("last_error_date") != today_str:
-                        reason = html.escape(str(res.get("msg", "未确认签到成功")))
-                        bot.send_msg(
-                            bot.admin_chat_id,
-                            f"⚠️ <b>烧饼论坛自动签到未完成</b>\n原因: <code>{reason}</code>\n"
-                            "<i>未记录为签到成功；如需人机验证，请在浏览器完成签到。</i>",
-                        )
-                        state["last_error_date"] = today_str
-                    save_checkin_state(state)
-
-        except Exception as e:
-            print(f"[{datetime.now()}] 签到调度器异常: {e}", flush=True)
-
+            execute_sbsb_signin(bot, allow_submit=True, automatic=True)
+        except Exception as exc:
+            print(f"[{datetime.now()}] 签到调度器异常: {type(exc).__name__}", flush=True)
         time.sleep(300)
 
 
@@ -1960,7 +1302,7 @@ def daily_quality_reporter_thread(bot):
                 bot.last_daily_report_date = today_str
                 print(f"[{datetime.now()}] 📊 生成并推送每日算法与监控健康度报告...", flush=True)
                 report_text = bot.generate_daily_report_card()
-                bot.send_msg(bot.admin_chat_id, report_text)
+                bot.send_msg(bot.admin_chat_id, report_text, reply_markup=bot.report_markup())
 
         except Exception as e:
             print(f"[{datetime.now()}] 每日报告调度异常: {e}", flush=True)
@@ -2194,11 +1536,10 @@ def sbsb_private_messages_thread(bot):
 
     def warn_login_required():
         now_ts = time.time()
-        if now_ts - bot.last_cookie_warn_time > 43200:
+        if not getattr(bot, "paused", False) and now_ts - bot.last_cookie_warn_time > 43200:
             bot.last_cookie_warn_time = now_ts
             bot.send_msg(bot.admin_chat_id, (
-                "⚠️ <b>🍪 [烧饼论坛] 登录凭据 (SBSB_COOKIE) 已过期！</b>\n\n"
-                "请在电脑浏览器重新登录烧饼论坛并复制 Cookie，更新至 VPS 的 <code>.env</code> 中。"
+                "⚠️ <b>烧饼登录已失效</b>\n\n暂时无法查询私信与互动，请更新登录凭据。"
             ))
 
     while True:
@@ -2273,19 +1614,20 @@ def sbsb_private_messages_thread(bot):
                     continue
 
                 if bot.remember_seen_msg(unique_key):
+                    if getattr(bot, "paused", False):
+                        continue
                     bot.total_private_notified += 1
                     bot.record_stat("private_notified")
                     print(f"[{datetime.now()}] 📬 命中烧饼论坛新互动通知: [{kind}] {user} - {content}", flush=True)
 
                     time_display = rel_time if rel_time else "未知时间"
                     msg_card = (
-                        f"📬 <b>🍪 [烧饼论坛] 收到新的互动通知！</b>\n\n"
-                        f"👤 <b>用户</b>: {user}  |  🏷️ <b>类型</b>: #{kind}\n"
-                        f"💬 <b>内容</b>: {content}\n"
-                        f"🕒 <b>时间</b>: {time_display}\n\n"
-                        f"🔗 <b>直达链接</b>: {link}"
+                        f"💬 <b>烧饼 · {tg_escape(kind, 40)}</b>\n\n"
+                        f"<b>{tg_escape(user, 100)}</b>\n"
+                        f"{tg_escape(content, 1000)}\n\n"
+                        f"论坛显示：{tg_escape(time_display, 80)}"
                     )
-                    bot.send_msg(bot.admin_chat_id, msg_card, disable_preview=False)
+                    bot.send_msg(bot.admin_chat_id, msg_card, reply_markup=keyboard([url_button("查看互动", link)]))
 
             # 2. 拉取私信信箱（1对1 私信消息）
             try:
@@ -2310,19 +1652,19 @@ def sbsb_private_messages_thread(bot):
                         continue
 
                     if bot.remember_seen_msg(thread_key):
+                        if getattr(bot, "paused", False):
+                            continue
                         bot.total_private_notified += 1
                         bot.record_stat("private_notified")
                         print(f"[{datetime.now()}] 📬 发现烧饼论坛新私信对话: {thread_id}", flush=True)
 
                         msg_text = (
-                            "📬 <b>🍪 [烧饼论坛] 收到新的私信对话！</b>\n\n"
-                            f"💬 <b>对话编号</b>: <code>{thread_id[:16]}...</code>\n"
-                            "💡 <i>您有新的私信消息，请点击下方直达链接查看。</i>\n\n"
-                            f"🔗 <b>直达链接</b>: https://sb.sb/messages/{thread_id}/"
+                            "✉️ <b>烧饼 · 新私信对话</b>\n\n收到一条新对话，请打开论坛查看。"
                         )
-                        bot.send_msg(bot.admin_chat_id, msg_text, disable_preview=False)
+                        bot.send_msg(bot.admin_chat_id, msg_text,
+                                     reply_markup=keyboard([url_button("打开对话", f"https://sb.sb/messages/{thread_id}/")]))
             except Exception as me:
-                print(f"[{datetime.now()}] 拉取私信异常: {me}", flush=True)
+                print(f"[{datetime.now()}] 拉取私信异常: {type(me).__name__}", flush=True)
 
             bot.save_seen_msgs()
             if first_run:

@@ -945,33 +945,35 @@ class ParticipationControlsTest(unittest.TestCase):
         self.bot.run_sbsb_participation([TOPIC])
         return self.bot.run_sbsb_participation([TOPIC])
 
-    def test_report_uses_report_date_when_participation_and_notifications_off(self):
+    def test_today_report_does_not_relabel_yesterdays_statistics(self):
         self.run_ready()
         self.bot.toggle_source('sbsb')
         self.bot.toggle_sbsb_participation()
         self.bot.daily_stats['date'] = '2026-10-11'
         with patch.object(self.main.BotManager, 'get_today_cst', return_value='2026-10-12'):
             report = self.bot.generate_daily_report_card()
-        self.assertIn('参与开关: 🔴 已关闭', report)
-        self.assertIn('抽奖: 自动提交确认 <b>1</b>', report)
-        self.assertIn('当日保守预算占用: <b>10/50</b>', report)
-        self.assertIn('提交预留 <b>1</b> 次', report)
-        self.assertNotIn('提交预留 <b>1/20</b>', report)
-        self.assertIn('活动推送: 🔴 已暂停', report)
+        self.assertIn('2026-10-12', report)
+        self.assertIn('烧饼抽奖：提交确认 0 项', report)
+        self.assertIn('抽奖预算预留：0 / 50 饼', report)
+        self.assertNotIn('提交预留', report)
+        with patch.object(self.main.BotManager, 'get_today_cst', return_value='2026-10-11'):
+            same_day = self.bot.generate_daily_report_card()
+        self.assertIn('烧饼抽奖：提交确认 1 项', same_day)
+        self.assertIn('抽奖预算预留：10 / 50 饼', same_day)
         self.assertEqual(self.client.post.call_count, 1)
 
     def test_report_does_not_fabricate_zero_for_invalid_ledger(self):
         with open(self.worker.ledger.path, 'w') as f: f.write('{broken')
         report = self.bot.generate_daily_report_card()
         self.assertIn('参与账本读取异常，统计暂不可用', report)
-        self.assertNotIn('自动提交确认 <b>0</b>', report)
+        self.assertNotIn('烧饼抽奖：提交确认 0 项', report)
         self.client.get.assert_not_called()
 
     def test_report_warns_missing_guard_and_preserves_statistics(self):
         self.worker.planner = ContentPlanner('', lambda: None)
         report = self.bot.generate_daily_report_card()
         self.assertIn('安全筛查未配置，当前无法自动参与', report)
-        self.assertIn('自动提交确认 <b>0</b>', report)
+        self.assertIn('烧饼抽奖：提交确认 0 项', report)
 
     def test_muted_notifications_still_execute_participation(self):
         self.bot.toggle_source('sbsb')
@@ -1060,17 +1062,17 @@ class ParticipationControlsTest(unittest.TestCase):
         self.bot.admin_chat_id = '7'
         self.bot.answer_callback_query = Mock()
         self.bot.edit_msg_text = Mock()
-        query = {'id': 'synthetic', 'from': {'id': 7}, 'data': 'toggle_participation:sbsb',
+        query = {'id': 'synthetic', 'from': {'id': 7}, 'data': 'participation:0',
                  'message': {'message_id': 1, 'chat': {'id': 7}}}
         self.main.handle_callback_query(self.bot, query)
         self.assertFalse(self.bot.sbsb_participation_enabled)
         self.assertTrue(self.bot.is_source_enabled('sbsb'))
         text, markup = self.bot.format_sources_card()
-        self.assertIn('红包/抽奖自动参与', text)
-        self.assertIn('关闭烧饼推送仍可自动参与', text)
+        self.assertIn('烧饼自动参与：关', text)
+        self.assertIn('关闭活动推送仍可自动参与', text)
         callbacks = [b['callback_data'] for row in markup['inline_keyboard'] for b in row]
-        self.assertIn('toggle_participation:sbsb', callbacks)
-        self.assertIn('toggle_src:sbsb', callbacks)
+        self.assertIn('participation:1', callbacks)
+        self.assertIn('source:sbsb:0', callbacks)
         query['from']['id'] = 9
         self.main.handle_callback_query(self.bot, query)
         self.assertFalse(self.bot.sbsb_participation_enabled)

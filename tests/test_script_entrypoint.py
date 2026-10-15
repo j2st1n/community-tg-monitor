@@ -63,11 +63,15 @@ def sleep(seconds):
         raise SchedulerStop()
     if seconds == 60:
         state = json.loads((pathlib.Path(os.environ['DATA_DIR']) / 'checkin_state.json').read_text())
-        assert state == {'last_date': today}, state
+        assert state['version'] == 2 and state['last_date'] == today, state
+        assert state['confirmation']['source'] == 'submitted_confirmed', state
+        assert state['confirmation']['consecutive_days'] == '48 天', state
+        assert state['notice']['status'] == 'accepted', state
+        assert 'submission_guard' not in state, state
         assert factory.call_count == 1
         assert cleanup == ['browser_closed', 'driver_stopped']
         assert len(notifications) == 1 and '自动签到成功' in notifications[0]
-        assert '连续签到</b>: <b>48 天' in notifications[0]
+        assert '连续 <b>48 天' in notifications[0]
         print(json.dumps({'entry_mode': os.environ['ENTRY_MODE'], 'completed': True,
                           'browser_calls': factory.call_count, 'network_mocked': True}))
         raise SystemExit(0)

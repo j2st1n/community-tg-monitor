@@ -21,6 +21,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Run offline unit tests on Python 3.12
+        run: >-
+          docker run --rm --network none
+          -e PYTHONDONTWRITEBYTECODE=1
+          -v "$GITHUB_WORKSPACE:/work:ro" -w /work
+          python:3.12-alpine python -m unittest discover -s tests
+
       - name: Set up QEMU (Multi-platform support)
         uses: docker/setup-qemu-action@v3
 

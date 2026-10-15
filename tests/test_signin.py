@@ -165,7 +165,9 @@ class SigninFlowTest(unittest.TestCase):
     def test_http_200_without_confirmed_signin_is_failure(self):
         result, opener = self.run_flow([Response(UNSIGNED), Response(), Response(UNSIGNED)])
         self.assertFalse(result['success'])
-        self.assertIn('人机验证', result['msg'])
+        self.assertEqual('submission_unconfirmed', result['outcome'])
+        self.assertNotIn('人机验证', result['msg'])
+        self.assertTrue(result['needs_human'])
         self.assertEqual(3, opener.open.call_count)
 
     def test_query_only_after_captcha_does_not_post_again(self):
@@ -174,7 +176,8 @@ class SigninFlowTest(unittest.TestCase):
         with patch.object(main.urllib.request, 'build_opener', return_value=opener):
             result = main.do_sbsb_signin('session', allow_submit=False)
         self.assertFalse(result['success'])
-        self.assertTrue(result['needs_human'])
+        self.assertFalse(result['needs_human'])
+        self.assertEqual('unsigned', result['outcome'])
         self.assertEqual(1, opener.open.call_count)
 
     def test_query_only_can_confirm_manual_signin(self):
@@ -213,12 +216,13 @@ class SigninFlowTest(unittest.TestCase):
         req = main.urllib.request.Request(main.SBSB_CHECKIN_URL, data=b'_csrf=test')
         self.assertIsNone(handler.redirect_request(req, None, 301, 'Moved', {}, main.SBSB_CHECKIN_URL))
 
-    def test_captcha_http_error_reports_failure(self):
+    def test_submission_http_error_does_not_guess_captcha_cause(self):
         error = urllib.error.HTTPError(main.SBSB_CHECKIN_URL, 403, 'Forbidden', {}, io.BytesIO(b'captcha'))
         result, _ = self.run_flow([Response(UNSIGNED), error])
         self.assertFalse(result['success'])
-        self.assertIn('HTTP 403', result['msg'])
-        self.assertIn('人机验证', result['msg'])
+        self.assertEqual('submission_http_403', result['error_code'])
+        self.assertEqual('submission_unconfirmed', result['outcome'])
+        self.assertNotIn('人机验证', result['msg'])
 
     def test_login_or_foreign_redirect_does_not_forward_cookie(self):
         for location in ('/login/', 'https://example.invalid/checkin/'):
@@ -283,7 +287,8 @@ class SigninSchedulerTest(unittest.TestCase):
         self.assertEqual('2026-10-08', state['last_error_date'])
         self.assertEqual(2, signin.call_count)
         self.assertEqual(1, bot.send_msg.call_count)
-        self.assertIn('&lt;captcha&gt;', bot.send_msg.call_args.args[1])
+        self.assertNotIn('<captcha>', bot.send_msg.call_args.args[1])
+        self.assertIn('无法确认签到状态', bot.send_msg.call_args.args[1])
 
     def test_successful_signin_is_marked_done_and_not_repeated(self):
         state, bot, signin = self.run_scheduler({'success': True, 'already': False})

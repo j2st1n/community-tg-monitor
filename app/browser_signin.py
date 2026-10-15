@@ -76,6 +76,8 @@ def failure(code, state=None):
         message = "浏览器签到未完成（" + code + "）；当天停止自动提交，请人工核对"
     result = {"success": False, "needs_human": True, "browser_stage": code,
               "msg": message}
+    if state is not None:
+        result["submission_attempted"] = state["checkin_posts"] > 0
     # This evidence permits only a fresh official GET, never success by itself.
     if (state is not None and state["checkin_posts"] == 1
             and state["checkin_response"] in (200, 302, 303)

@@ -18,7 +18,7 @@ ORIGIN = "https://sb.sb"
 CST = timezone(timedelta(hours=8))
 COMMITTED = {"reserved", "confirmed", "uncertain"}
 TERMINAL = COMMITTED | {"already", "skipped", "review"}
-POLICY_VERSION = 3
+POLICY_VERSION = 4
 RECONSIDER_REASONS = {"public_content_unavailable", "manual_requirements", "unsafe_content", "reply_rejected"}
 NEUTRAL_REPLIES = (
     "谢谢分享红包，来参与一下。", "感谢楼主的红包，来凑个热闹。",
@@ -282,7 +282,11 @@ class TopicPage(HTMLParser):
                 raise ParticipationError("ended")
             cost = 0
         if not self.body or len(self.body) > 6000: raise ParticipationError("content_unavailable")
-        return {"action": action, "fields": fields, "cost": cost, "uid": self.uid, "body": self.body}
+        instructions = re.search(r"回帖即可(?:参与|领取)[^。]{0,160}(?:。|$)", self.widget_text)
+        return {"action": action, "fields": fields, "cost": cost, "uid": self.uid, "body": self.body,
+                "forum_activity": {"origin": ORIGIN, "kind": self.kind,
+                                   "entry_method": "reply" if self.kind == "redpacket" else "paid_form",
+                                   "widget_instructions": instructions[0] if instructions else ""}}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -409,7 +413,7 @@ class ContentPlanner:
             return {k: answer[k] for k in ("choice", "confidence", "probabilities")}
         except Exception: raise ParticipationError("guard_unavailable")
 
-    def prepare(self, title, topic_body, kind):
+    def prepare(self, title, topic_body, kind, *, forum_activity=None):
         length = reply_length_constraints(title, topic_body) if kind == "redpacket" else None
         minimum, maximum = (length["minimum"], length["maximum"]) if length else (6, 80)
         state = {"topic_title": title[:300], "topic_body": topic_body, "activity_kind": kind,
@@ -417,6 +421,14 @@ class ContentPlanner:
                  "reply_max_chars": maximum if kind == "redpacket" else None,
                  "reply_length_rules": length["rules"] if length else None,
                  "reply_length_executable": length["valid"] if length else False}
+        # The independently checked widget describes the forum activity. The
+        # first post may instead describe how to claim a separate advertised offer.
+        if (isinstance(forum_activity, dict) and forum_activity.get("origin") == ORIGIN
+                and forum_activity.get("kind") == kind
+                and forum_activity.get("entry_method") in {"reply", "paid_form"}
+                and isinstance(forum_activity.get("widget_instructions"), str)):
+            state["forum_activity"] = {key: forum_activity[key] for key in
+                                       ("origin", "kind", "entry_method", "widget_instructions")}
         details = {"reply_min_chars": state["reply_min_chars"], "reply_max_chars": state["reply_max_chars"], "draft_attempts": []}
         if length: details["reply_length_rules"] = length["rules"]
         self.last_diagnostics = details
@@ -437,6 +449,8 @@ class ContentPlanner:
             requirement_state = {"topic_title": length["title"][:300], "topic_body": length["body"],
                                  "activity_kind": kind, "original_input_verified": True,
                                  "no_remaining_body_conditions": not bool(re.search(r"\w", length["body"]))}
+            if "forum_activity" in state:
+                requirement_state["forum_activity"] = state["forum_activity"]
             if score > .15:
                 # Input injection/prose checks have already used the ORIGINAL text.
                 # Rejudge only the residue, without reclassifying executable lengths as extra tasks.
@@ -444,6 +458,22 @@ class ContentPlanner:
                     "Do the remaining `topic_title`/`topic_body` explicitly make purchase, signup, follow/share, group membership, proof, review, qualification, mandatory experience or specific reply wording a prerequisite for THIS verified forum activity? Code has removed ONLY executable reply-length clauses, including an immediately attached reward-only ending, and validates lengths on the actual draft. Do not rejudge the removed numerical rules. All other original prose remains, including any neighboring prerequisite. `no_remaining_body_conditions=true` means the complete body contained only the handled length clause; it is not missing or hidden evidence. In that case check ONLY the title for an explicit extra task. A bare reward statement, greeting or ordinary discussion is not an extra task."}, details, "length_requirements")
                 details["remaining_requirement_scores"] = scores
                 score = scores["additional"]
+        # Resolve the relationship before asking a broad choice again. Both
+        # answers must support a separate offer; an unclear or explicit forum
+        # condition still goes through the existing review/denial path.
+        if (.15 < score < .85 and kind == "redpacket" and (not length or length["valid"])
+                and state.get("forum_activity", {}).get("entry_method") == "reply"
+                and state["forum_activity"].get("widget_instructions")):
+            scope = self.evaluate(requirement_state, {
+                "forum_prerequisite": "Does the author make an extra action a prerequisite for entering or claiming THIS sb.sb forum redpacket? Use topic_title/topic_body together with the separately verified forum_activity. Yes requires a relationship to the forum redpacket: e.g. register/follow/pay/provide proof before getting 烧饼 or before this reply qualifies. A purchase obligation to receive the forum prize also counts. Normal entry fees and executable reply-length rules already handled by code do not count. Instructions for obtaining an advertised external product's trial, invitation credits or tokens do not establish a forum requirement by themselves. Do not infer a relationship merely because both offers occur in the same post.",
+                "external_offer_instructions": "Are the apparent registration, invitation, bot, activation or redemption instructions about obtaining a separate advertised external benefit (such as proxy trial traffic or another service's token credits), rather than a condition for this forum redpacket? Read the full first post. Yes needs a clearly identified separate benefit. A forum condition remains a forum condition even when it uses an external site; mixed, ambiguous or hidden prerequisites are not a clear separate-offer-only case."
+            }, details, "requirement_scope")
+            details["requirement_scope_scores"] = scope
+            if scope["forum_prerequisite"] <= .15 and scope["external_offer_instructions"] >= .85:
+                score = 0
+                details["requirement_scope"] = "separate_external_offer"
+            elif scope["forum_prerequisite"] >= .85:
+                score = 1
         additional = score > 0.15
         if additional and score < .85 and (not length or length["valid"]):
             details["guard_stage"] = "requirements"
@@ -650,7 +680,9 @@ class Participant:
     def should_reconsider(row):
         version = row.get("policy_version", 1)
         eligible = (version == 1 and row.get("reason") in RECONSIDER_REASONS) or (
-            version == 2 and row.get("kind") == "redpacket" and row.get("reason") == "reply_rejected")
+            version == 2 and row.get("kind") == "redpacket" and row.get("reason") == "reply_rejected") or (
+            version in (2, 3) and row.get("kind") == "redpacket"
+            and row.get("reason") == "manual_requirements")
         return (row.get("status") in {"skipped", "review"} and row.get("cost") == 0
                 and row.get("kind") in {"lottery", "redpacket"}
                 and eligible and type(version) is int and version < POLICY_VERSION
@@ -683,7 +715,11 @@ class Participant:
                 self.ledger.save(state)
                 return "daily_budget"
             row["title"] = (page.title or topic["title"])[:300]
-            reply = self.planner.prepare(row["title"], plan["body"], kind)
+            if isinstance(self.planner, ContentPlanner):
+                reply = self.planner.prepare(row["title"], plan["body"], kind,
+                                             forum_activity=plan["forum_activity"])
+            else:
+                reply = self.planner.prepare(row["title"], plan["body"], kind)
             if isinstance(self.planner, ContentPlanner): row["diagnostics"] = self.planner.last_diagnostics
             # Refresh authentication, CSRF, membership, content, deadline and price.
             fresh = TopicPage(self.client.get(path), kind)

@@ -132,8 +132,9 @@ class PipelineTest(unittest.TestCase):
         model._chat.return_value = {'reply': '休息日也来领份饼，谢谢分享！'}
         planner = ContentPlanner('synthetic-key', lambda: model)
         planner.noul = Mock(side_effect=[{'injection': .02, 'relevant': .98, 'additional': .6},
-                                        {'forum_prerequisite': .04, 'external_offer_instructions': .96},
                                         {'invented': .01, 'unsafe': .01, 'relevant': .99}])
+        planner.requirement_choice = Mock(return_value={'choice': 'ordinary_entry', 'confidence': .95,
+            'probabilities': {'ordinary_entry': .95, 'additional_action': .03, 'unclear': .02}})
         self.worker.planner = planner
         self.client.get.side_effect = [value.replace('已领 2 / 5 份，还剩 3 个烧饼。',
              '已领 2 / 5 份，还剩 3 个烧饼。回帖即可领取，每人一份。')
@@ -142,10 +143,10 @@ class PipelineTest(unittest.TestCase):
                            page('redpacket', body='注册代理网站获得试用流量。', joined=True))]
         topic = {**TOPIC, 'badge_kind': 'redpacket'}
         self.assertEqual(self.run_ready([topic]), {TOPIC['link']: 'confirmed'})
-        self.assertEqual(planner.noul.call_args_list[1].args[0]['forum_activity']['entry_method'], 'reply')
+        self.assertEqual(planner.requirement_choice.call_args.args[0]['forum_activity']['entry_method'], 'reply')
         self.client.post.assert_called_once()
         row = self.ledger.load()['entries']['123']
-        self.assertEqual(row['diagnostics']['requirement_scope'], 'separate_external_offer')
+        self.assertEqual(row['diagnostics']['eligibility'], {'rounds': 2, 'first': 'pending', 'final': 'allow'})
         self.assertTrue(row['submission_accepted'])
         self.assertEqual(row['cost'], 0)
 
@@ -558,13 +559,11 @@ class ReplyLengthTest(unittest.TestCase):
 class PlannerTest(unittest.TestCase):
     def test_length_only_reward_body_does_not_reintroduce_handled_numbers_or_orphan_tail(self):
         p, model = self.make_planner()
-        p.noul.side_effect = [{'injection': .04, 'relevant': .89, 'additional': .22},
-                             {'additional': .01}, {'invented': .01, 'unsafe': .01, 'relevant': .99}]
-        self.assertEqual(p.prepare('今日快乐', '回帖需要 3 个字才能领取', 'redpacket'), '周末来领份饼，感谢分享！')
-        residual = p.noul.call_args_list[1].args[0]
-        self.assertEqual(residual['topic_body'], '')
-        self.assertTrue(residual['no_remaining_body_conditions'])
-        self.assertNotIn('reply_length_rules', residual); self.assertNotIn('reply_min_chars', residual)
+        p.prepare('今日快乐', '回帖需要 3 个字才能领取', 'redpacket')
+        state = p.noul.call_args_list[0].args[0]
+        self.assertEqual(state['requirement_text']['body'], '')
+        self.assertTrue(state['requirement_text']['no_remaining_body_conditions'])
+        self.assertEqual(state['topic_body'], '回帖需要 3 个字才能领取')
         p.requirement_choice.assert_not_called()
     def test_legacy_count_setting_does_not_block_twenty_first_entry(self):
         for setting in ('1', '20', '9999', 'invalid'):
@@ -591,7 +590,7 @@ class PlannerTest(unittest.TestCase):
         p=ContentPlanner('synthetic-key',lambda:model)
         p.noul=Mock(side_effect=[{'injection':0.01,'relevant':0.99,'additional':0.01},{'invented':0.01,'unsafe':0.01,'relevant':0.99}])
         p.requirement_choice = Mock(return_value={'choice': 'additional_action', 'confidence': .99,
-            'probabilities': {'reply_only': .01, 'additional_action': .99, 'unclear': 0}})
+            'probabilities': {'ordinary_entry': .01, 'additional_action': .99, 'unclear': 0}})
         return p,model
 
     def test_reply_generated_from_account_visible_prose_without_credentials(self):
@@ -662,23 +661,23 @@ class PlannerTest(unittest.TestCase):
         for body in ('回帖需要 3 个字才能领取', '回复三个字，你 + 2，我 + 1', '回帖要四个字哦'):
             with self.subTest(body=body):
                 p, model = self.make_planner()
-                p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .95},
-                                     {'additional': .01}, {'invented': .01, 'unsafe': .01, 'relevant': .99}]
                 reply = p.prepare('红包', body, 'redpacket')
                 self.assertGreaterEqual(len(reply), p.last_diagnostics['reply_min_chars'])
-                self.assertEqual(p.noul.call_args_list[0].args[0]['topic_body'], body)
-                self.assertNotIn('字', p.noul.call_args_list[1].args[0]['topic_body'])
+                state = p.noul.call_args_list[0].args[0]
+                self.assertEqual(state['topic_body'], body)
+                self.assertNotIn('字', state['requirement_text']['body'])
                 p.requirement_choice.assert_not_called()
-                self.assertEqual(p.last_diagnostics['remaining_requirement_scores'], {'additional': .01})
+                self.assertEqual(p.noul.call_count, 2)  # eligibility + draft, no residue rejudgment
 
-    def test_length_with_real_extra_requirement_remains_manual(self):
+    def test_length_with_real_extra_requirement_is_declined(self):
         p, model = self.make_planner()
-        p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .95}, {'additional': .95}]
+        p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .95}]
         with self.assertRaises(ParticipationError) as e:
             p.prepare('红包', '回复三个字，并注册网站后才能领取', 'redpacket')
         self.assertEqual(e.exception.code, 'manual_requirements')
-        self.assertIn('并注册网站后才能领取', p.noul.call_args_list[1].args[0]['topic_body'])
-        model._chat.assert_not_called()
+        state = p.noul.call_args_list[0].args[0]
+        self.assertIn('并注册网站后才能领取', state['requirement_text']['body'])
+        model._chat.assert_not_called(); p.requirement_choice.assert_not_called()
 
     def test_original_input_injection_is_checked_before_length_residue(self):
         p, model = self.make_planner()
@@ -688,12 +687,13 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(e.exception.code, 'unsafe_content'); self.assertEqual(p.noul.call_count, 1)
         model._chat.assert_not_called()
 
-    def test_residual_requirement_guard_failure_never_generates_or_falls_back(self):
+    def test_final_requirement_guard_failure_never_generates_or_falls_back(self):
         p, model = self.make_planner()
-        p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .7}, ParticipationError('guard_unavailable')]
+        p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .7}]
+        p.requirement_choice.side_effect = ParticipationError('guard_unavailable')
         with self.assertRaises(ParticipationError) as e: p.prepare('红包', '回复三个字', 'redpacket')
-        self.assertEqual(e.exception.code, 'guard_unavailable')
-        self.assertEqual(e.exception.diagnostics['guard_stage'], 'length_requirements'); model._chat.assert_not_called()
+        self.assertEqual(e.exception.code, 'final_review_unavailable')
+        self.assertEqual(e.exception.diagnostics['guard_stage'], 'eligibility_final'); model._chat.assert_not_called()
 
     def test_exact_and_maximum_lengths_are_checked_on_generated_reply_and_fallback(self):
         p, model = self.make_planner('来参与')
@@ -727,38 +727,39 @@ class PlannerTest(unittest.TestCase):
         with self.assertRaises(ParticipationError) as e: p.prepare('发红包', '大家来吃饼', 'redpacket')
         self.assertEqual(e.exception.diagnostics['guard_stage'], 'draft')
 
-    def test_ambiguous_requirement_gets_contextual_review_instead_of_blanket_skip(self):
+    def test_ambiguous_requirement_gets_one_final_review_instead_of_blanket_skip(self):
         p, model = self.make_planner()
         p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .24},
-                             {'additional': .24},
                              {'invented': .01, 'unsafe': .01, 'relevant': .99}]
-        p.requirement_choice.return_value = {'choice': 'reply_only', 'confidence': .98,
-            'probabilities': {'reply_only': .98, 'additional_action': .01, 'unclear': .01}}
+        p.requirement_choice.return_value = {'choice': 'ordinary_entry', 'confidence': .98,
+            'probabilities': {'ordinary_entry': .98, 'additional_action': .01, 'unclear': .01}}
         self.assertEqual(p.prepare('每日一饼', '评论区留言，字数要超过 3 个字，随便聊聊，点支持更棒', 'redpacket'), '周末来领份饼，感谢分享！')
         self.assertEqual(p.requirement_choice.call_count, 1)
-        self.assertEqual(p.last_diagnostics['requirement_decision']['choice'], 'reply_only')
+        self.assertEqual(p.noul.call_count, 2)  # first eligibility + draft
+        self.assertEqual(p.last_diagnostics['eligibility'], {'rounds': 2, 'first': 'pending', 'final': 'allow'})
 
     def test_unclear_requirement_and_reviewer_failure_do_not_generate(self):
         p, model = self.make_planner()
         p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .3}]
         p.requirement_choice.return_value = {'choice': 'unclear', 'confidence': .95,
-            'probabilities': {'reply_only': .03, 'additional_action': .02, 'unclear': .95}}
+            'probabilities': {'ordinary_entry': .03, 'additional_action': .02, 'unclear': .95}}
         with self.assertRaises(ParticipationError) as e: p.prepare('红包', '条件不明', 'redpacket')
-        self.assertEqual(e.exception.code, 'manual_requirements'); model._chat.assert_not_called()
+        self.assertEqual(e.exception.code, 'final_review_unclear'); model._chat.assert_not_called()
         p, model = self.make_planner()
         p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .3}]
         p.requirement_choice.side_effect = ParticipationError('guard_unavailable')
         with self.assertRaises(ParticipationError) as e: p.prepare('红包', '条件不明', 'redpacket')
-        self.assertEqual(e.exception.diagnostics['guard_stage'], 'requirements'); model._chat.assert_not_called()
+        self.assertEqual(e.exception.code, 'final_review_unavailable')
+        self.assertEqual(e.exception.diagnostics['guard_stage'], 'eligibility_final'); model._chat.assert_not_called()
 
     def test_requirement_probability_distribution_controls_contextual_review(self):
-        for probabilities, expected in [({'reply_only': .82, 'additional_action': .17, 'unclear': .01}, True),
-                                        ({'reply_only': .79, 'additional_action': .20, 'unclear': .01}, False),
-                                        ({'reply_only': .82, 'additional_action': .06, 'unclear': .12}, False)]:
+        for probabilities, expected in [({'ordinary_entry': .82, 'additional_action': .17, 'unclear': .01}, True),
+                                        ({'ordinary_entry': .79, 'additional_action': .20, 'unclear': .01}, False),
+                                        ({'ordinary_entry': .82, 'additional_action': .06, 'unclear': .12}, False)]:
             p, model = self.make_planner()
             p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .24},
                                  {'invented': .01, 'unsafe': .01, 'relevant': .99}]
-            p.requirement_choice.return_value = {'choice': 'reply_only', 'confidence': .73, 'probabilities': probabilities}
+            p.requirement_choice.return_value = {'choice': 'ordinary_entry', 'confidence': .73, 'probabilities': probabilities}
             if expected: self.assertEqual(p.prepare('买卖帖', '先号后款', 'redpacket'), '周末来领份饼，感谢分享！')
             else:
                 with self.assertRaises(ParticipationError): p.prepare('买卖帖', '先号后款', 'redpacket')
@@ -772,56 +773,55 @@ class PlannerTest(unittest.TestCase):
         return {'origin': 'https://sb.sb', 'kind': 'redpacket', 'entry_method': 'reply',
                 'widget_instructions': '回帖即可参与；到期自动开奖。'}
 
-    def test_separate_product_trials_and_bot_credits_do_not_become_forum_conditions(self):
+    def test_separate_product_trials_and_bot_credits_reach_final_reviewer_with_full_context(self):
         for body in ('注册代理网站后用兑换码领取试用流量。',
                      '进入自助机器人发送邀请码，即可为外部账户充值词元。',
                      '通过邀请链接注册可得试用额度，按页面指引兑换。'):
             with self.subTest(body=body):
                 p, model = self.make_planner()
                 p.noul.side_effect = [{'injection': .04, 'relevant': .96, 'additional': .63},
-                                     {'forum_prerequisite': .05, 'external_offer_instructions': .96},
                                      {'invented': .01, 'unsafe': .01, 'relevant': .99}]
+                p.requirement_choice.return_value = {'choice': 'ordinary_entry', 'confidence': .95,
+                    'probabilities': {'ordinary_entry': .95, 'additional_action': .03, 'unclear': .02}}
                 p.prepare('新人试用福利', body, 'redpacket', forum_activity=self.forum_context())
-                p.requirement_choice.assert_not_called()
-                self.assertEqual(p.last_diagnostics['requirement_scope'], 'separate_external_offer')
-                scope_state = p.noul.call_args_list[1].args[0]
-                self.assertEqual(scope_state['topic_body'], body)
-                self.assertEqual(scope_state['forum_activity']['entry_method'], 'reply')
+                p.requirement_choice.assert_called_once()
+                state = p.requirement_choice.call_args.args[0]
+                self.assertEqual(state['topic_body'], body)
+                self.assertEqual(state['forum_activity']['entry_method'], 'reply')
+                self.assertNotIn('input_scores', state)  # final judge has evidence, not a previous verdict
                 self.assertEqual(model._chat.call_count, 1)
 
-    def test_forum_bound_registration_follow_and_paid_prize_remain_manual(self):
+    def test_forum_bound_registration_follow_and_paid_prize_are_finally_declined(self):
         for body in ('必须注册网站后才能领取本帖红包。',
                      '仅限关注楼主的粉丝领取烧饼，回帖须附证明。',
                      '本次中奖后必须付费购买奖品，未付款不发奖。'):
             with self.subTest(body=body):
                 p, model = self.make_planner()
-                p.noul.side_effect = [{'injection': .03, 'relevant': .96, 'additional': .63},
-                                     {'forum_prerequisite': .96, 'external_offer_instructions': .92}]
+                p.noul.side_effect = [{'injection': .03, 'relevant': .96, 'additional': .63}]
                 with self.assertRaises(ParticipationError) as error:
                     p.prepare('红包活动', body, 'redpacket', forum_activity=self.forum_context())
-                self.assertEqual(error.exception.code, 'manual_requirements')
-                model._chat.assert_not_called()
+                self.assertEqual(error.exception.code, 'final_review_denied')
+                p.requirement_choice.assert_called_once(); model._chat.assert_not_called()
 
-    def test_scope_uncertainty_and_missing_separate_benefit_do_not_override_choice(self):
-        for scores in ({'forum_prerequisite': .4, 'external_offer_instructions': .95},
-                       {'forum_prerequisite': .1, 'external_offer_instructions': .6}):
-            p, model = self.make_planner()
-            p.noul.side_effect = [{'injection': .03, 'relevant': .96, 'additional': .56}, scores]
-            with self.assertRaises(ParticipationError):
-                p.prepare('活动', '按步骤操作才可领取，条件不明。', 'redpacket',
-                          forum_activity=self.forum_context())
-            p.requirement_choice.assert_called_once()
-            model._chat.assert_not_called()
-
-    def test_scope_check_failure_is_retryable_and_never_generates(self):
+    def test_final_uncertainty_cannot_be_overridden_by_another_model_round(self):
         p, model = self.make_planner()
-        p.noul.side_effect = [{'injection': .03, 'relevant': .96, 'additional': .56},
-                             ParticipationError('guard_unavailable')]
+        p.noul.side_effect = [{'injection': .03, 'relevant': .96, 'additional': .56}]
+        p.requirement_choice.return_value = {'choice': 'unclear', 'confidence': .9,
+            'probabilities': {'ordinary_entry': .05, 'additional_action': .05, 'unclear': .9}}
         with self.assertRaises(ParticipationError) as error:
-            p.prepare('活动', '注册代理网站获取试用流量。', 'redpacket',
-                      forum_activity=self.forum_context())
-        self.assertEqual(error.exception.code, 'guard_unavailable')
-        self.assertEqual(error.exception.diagnostics['guard_stage'], 'requirement_scope')
+            p.prepare('活动', '按步骤操作才可领取，条件不明。', 'redpacket', forum_activity=self.forum_context())
+        self.assertEqual(error.exception.code, 'final_review_unclear')
+        p.requirement_choice.assert_called_once(); self.assertEqual(p.noul.call_count, 1)
+        model._chat.assert_not_called()
+
+    def test_final_check_failure_is_terminal_and_never_generates(self):
+        p, model = self.make_planner()
+        p.noul.side_effect = [{'injection': .03, 'relevant': .96, 'additional': .56}]
+        p.requirement_choice.side_effect = ParticipationError('guard_unavailable')
+        with self.assertRaises(ParticipationError) as error:
+            p.prepare('活动', '注册代理网站获取试用流量。', 'redpacket', forum_activity=self.forum_context())
+        self.assertEqual(error.exception.code, 'final_review_unavailable')
+        self.assertEqual(error.exception.diagnostics['eligibility']['final'], 'skip')
         model._chat.assert_not_called()
 
     def test_input_guard_and_unsupported_length_still_precede_scope_override(self):
@@ -833,19 +833,20 @@ class PlannerTest(unittest.TestCase):
             self.assertEqual(p.noul.call_count, 1)
             model._chat.assert_not_called()
 
-    def test_widget_context_excludes_authentication_and_survives_length_residue(self):
+    def test_widget_context_excludes_authentication_and_survives_length_normalization(self):
         p, model = self.make_planner()
         p.noul.side_effect = [{'injection': .01, 'relevant': .96, 'additional': .56},
-                             {'additional': .56},
-                             {'forum_prerequisite': .04, 'external_offer_instructions': .96},
                              {'invented': .01, 'unsafe': .01, 'relevant': .99}]
+        p.requirement_choice.return_value = {'choice': 'ordinary_entry', 'confidence': .95,
+            'probabilities': {'ordinary_entry': .95, 'additional_action': .03, 'unclear': .02}}
         p.prepare('活动', '回复三个字。注册代理网站获得试用流量。', 'redpacket',
                   forum_activity={**self.forum_context(), '_csrf': 'synthetic-secret', 'Cookie': 'synthetic-session'})
-        scoped = p.noul.call_args_list[2].args[0]
-        self.assertEqual(scoped['forum_activity'], self.forum_context())
-        self.assertNotIn('三个字', scoped['topic_body'])
+        state = p.requirement_choice.call_args.args[0]
+        self.assertEqual(state['forum_activity'], self.forum_context())
+        self.assertNotIn('三个字', state['requirement_text']['body'])
+        self.assertIn('回复三个字', state['topic_body'])
         self.assertNotIn('synthetic-secret', json.dumps(model._chat.call_args.args[0]))
-        self.assertNotIn('synthetic-session', json.dumps(scoped))
+        self.assertNotIn('synthetic-session', json.dumps(state))
 
 
 class TransportTest(unittest.TestCase):
@@ -968,8 +969,8 @@ class ReconsiderationTest(unittest.TestCase):
         target = self.legacy_row(kind='redpacket', status='review', reason='reply_rejected', policy_version=2)
         rows = {'123': target}
         for key, extra in enumerate([
-            {'reason': 'unsafe_content'},
-            {'kind': 'lottery'}, {'policy_version': POLICY_VERSION},
+            {'reason': 'unsafe_content', 'status': 'skipped'},
+            {'kind': 'lottery', 'status': 'skipped'}, {'policy_version': POLICY_VERSION},
             {'submission_accepted': False}, {'transport_code': 'post_unconfirmed'},
             {'http_status': 200}, {'status': 'uncertain'}, {'cost': 1},
         ], 124): rows[str(key)] = {**target, **extra}
@@ -988,7 +989,7 @@ class ReconsiderationTest(unittest.TestCase):
             for change in ({'status': 'uncertain'}, {'status': 'confirmed'}, {'cost': 1},
                            {'submission_accepted': False}, {'transport_code': 'post_unconfirmed'},
                            {'http_status': 200}, {'reason': 'verification_required'},
-                           {'kind': 'lottery'}, {'policy_version': POLICY_VERSION}):
+                           {'kind': 'lottery', 'status': 'skipped'}, {'policy_version': POLICY_VERSION}):
                 with self.subTest(version=version, change=change):
                     self.assertFalse(self.worker.should_reconsider({**row, **change}))
         row = self.legacy_row(kind='redpacket', status='review', reason='manual_requirements', policy_version=3)
@@ -1205,6 +1206,200 @@ class ParticipationControlsTest(unittest.TestCase):
         query['from']['id'] = 9
         self.main.handle_callback_query(self.bot, query)
         self.assertFalse(self.bot.sbsb_participation_enabled)
+
+
+
+class FinalReviewLifecycleTest(unittest.TestCase):
+    setUp = PipelineTest.setUp
+    run_ready = PipelineTest.run_ready
+
+    def set_planner(self, verdict='unclear', error=None, score=.5):
+        model = Mock(model='synthetic')
+        model._chat.return_value = {'reply': '休息日也来领份饼，谢谢分享！'}
+        p = ContentPlanner('synthetic-key', lambda: model)
+        p.noul = Mock(side_effect=[{'injection': .01, 'relevant': .99, 'additional': score},
+                                  {'invented': .01, 'unsafe': .01, 'relevant': .99}])
+        probabilities = {k: .02 for k in ('ordinary_entry', 'additional_action', 'unclear')}
+        probabilities[verdict] = .96
+        p.requirement_choice = Mock(return_value={'choice': verdict, 'confidence': .95,
+                                                  'probabilities': probabilities}, side_effect=error)
+        self.worker.planner = p
+        return p, model
+
+    def test_final_unclear_denial_and_api_failure_are_durable_skips_after_restart(self):
+        for verdict, error, reason in [('unclear', None, 'final_review_unclear'),
+                ('additional_action', None, 'final_review_denied'),
+                ('unclear', ParticipationError('guard_unavailable'), 'final_review_unavailable')]:
+            with self.subTest(reason=reason):
+                self.ledger.save({'version': 1, 'entries': {}})
+                self.client.get.side_effect = [page()]
+                p, model = self.set_planner(verdict, error)
+                self.assertEqual(self.run_ready([TOPIC])[TOPIC['link']], reason)
+                row = self.ledger.load()['entries']['123']
+                self.assertEqual((row['status'], row['attempts'], row['cost']), ('skipped', 1, 0))
+                self.assertEqual(row['diagnostics']['eligibility'], {'rounds': 2, 'first': 'pending', 'final': 'skip'})
+                before = self.ledger.load()
+                restarted = Participant(self.ledger, self.client, p, clock=lambda: NOW + 9999)
+                for _ in range(4): self.assertEqual(restarted.run([TOPIC]), {})
+                self.assertEqual(self.ledger.load(), before)
+                p.requirement_choice.assert_called_once(); self.assertEqual(p.noul.call_count, 1)
+                model._chat.assert_not_called(); self.client.post.assert_not_called()
+
+    def test_clear_first_pass_does_not_invoke_final_reviewer(self):
+        p, model = self.set_planner('ordinary_entry', score=.15)
+        self.assertEqual(self.run_ready([TOPIC])[TOPIC['link']], 'confirmed')
+        p.requirement_choice.assert_not_called(); model._chat.assert_not_called()
+        self.assertEqual(p.last_diagnostics['eligibility'], {'rounds': 1, 'first': 'allow', 'final': 'allow'})
+        self.client.post.assert_called_once()
+
+    def test_clear_first_denial_is_terminal_without_second_pass(self):
+        p, model = self.set_planner('ordinary_entry', score=.85)
+        self.client.get.side_effect = [page()]
+        self.assertEqual(self.run_ready([TOPIC])[TOPIC['link']], 'manual_requirements')
+        self.assertEqual(self.ledger.load()['entries']['123']['status'], 'skipped')
+        p.requirement_choice.assert_not_called(); model._chat.assert_not_called()
+        self.client.post.assert_not_called()
+
+    def test_final_lottery_approval_still_obeys_fee_refresh(self):
+        p, model = self.set_planner('ordinary_entry')
+        self.client.get.side_effect = [page(fee=1), page(fee=2)]
+        self.assertEqual(self.run_ready([TOPIC])[TOPIC['link']], 'topic_changed')
+        self.assertEqual(self.ledger.load()['entries']['123']['status'], 'skipped')
+        p.requirement_choice.assert_called_once(); model._chat.assert_not_called()
+        self.client.post.assert_not_called()
+
+    def test_guard_and_reply_api_errors_do_not_trigger_new_ai_rounds(self):
+        for error in ('guard_unavailable', 'reply_unavailable', 'reply_rejected', 'unsafe_content'):
+            with self.subTest(error=error):
+                self.ledger.save({'version': 1, 'entries': {}})
+                self.client.get.side_effect = [page()]
+                self.planner.prepare.side_effect = ParticipationError(error)
+                self.assertEqual(self.run_ready([TOPIC])[TOPIC['link']], error)
+                self.assertEqual(self.ledger.load()['entries']['123']['status'], 'skipped')
+                self.assertEqual(self.worker.run([TOPIC]), {})
+        self.client.post.assert_not_called()
+
+    def test_hard_widget_requirements_and_verification_are_skipped_without_ai(self):
+        for html, reason in [(page().replace('52 人已参与', '参与要求请阅读'), 'manual_requirements'),
+                             (page(extra='<cap-widget></cap-widget>'), 'verification_required')]:
+            self.ledger.save({'version': 1, 'entries': {}})
+            self.client.get.side_effect = [html]
+            self.assertEqual(self.run_ready([TOPIC])[TOPIC['link']], reason)
+            self.assertEqual(self.ledger.load()['entries']['123']['status'], 'skipped')
+        self.planner.prepare.assert_not_called(); self.client.post.assert_not_called()
+
+    def test_old_manual_reviews_recheck_once_but_post_evidence_is_never_replayed(self):
+        for kind, reason in [('lottery', 'manual_requirements'), ('redpacket', 'unsafe_content')]:
+            row = dict(kind=kind, status='review', reason=reason, cost=0, day='2026-10-11',
+                       at=NOW - 1000, attempts=1, policy_version=4)
+            self.assertTrue(self.worker.should_reconsider(row))
+            for change in ({'status': 'uncertain'}, {'cost': 1}, {'submission_accepted': False},
+                           {'transport_code': 'post_unconfirmed'}, {'http_status': 200}, {'policy_version': 5}):
+                self.assertFalse(self.worker.should_reconsider({**row, **change}))
+            self.ledger.save({'version': 1, 'entries': {'123': row}})
+            self.client.get.side_effect = [page(kind, deadline='2026-10-11T03:00:00Z')]
+            self.assertEqual(self.worker.run([]), {TOPIC['link']: 'waiting'})
+            self.assertEqual(self.worker.run([]), {TOPIC['link']: 'ended'})
+            self.assertEqual(self.worker.run([]), {})
+            self.assertEqual(self.ledger.load()['entries']['123']['status'], 'skipped')
+        self.planner.prepare.assert_not_called(); self.client.post.assert_not_called()
+
+    def make_uncertain(self, kind='lottery'):
+        self.client.post.side_effect = ParticipationError('post_redirect_unconfirmed')
+        self.client.get.side_effect = [page(kind), page(kind), page(kind)]
+        topic = {**TOPIC, 'badge_kind': kind}
+        self.assertEqual(self.run_ready([topic])[TOPIC['link']], 'uncertain')
+        row = self.ledger.load()['entries']['123']
+        self.assertEqual(row['participant_uid'], '7')
+        return topic
+
+    def test_submission_uncertainty_get_confirmation_preserves_cost_and_never_posts_again(self):
+        topic = self.make_uncertain()
+        before = self.ledger.load()['entries']['123'].copy()
+        self.worker.clock = lambda: NOW + 299
+        self.assertEqual(self.worker.run([topic]), {})
+        self.assertNotIn('confirmation_checks', self.ledger.load()['entries']['123'])
+        self.worker.clock = lambda: NOW + 300
+        self.client.get.side_effect = [page(joined=True)]
+        self.assertEqual(self.worker.run([topic]), {})
+        row = self.ledger.load()['entries']['123']
+        self.assertEqual((row['status'], row['submission_accepted'], row['cost']), ('confirmed', False, 10))
+        self.assertEqual(row['reconciliation_source'], 'official_get')
+        self.assertEqual(row['at'], before['at'])
+        self.assertEqual(row['transport_code'], 'post_redirect_unconfirmed')
+        self.assertEqual(self.ledger.usage(self.ledger.load(), '2026-10-11'), (10, 1))
+        self.client.post.assert_called_once(); self.planner.prepare.assert_called_once()
+
+    def test_random_redpacket_recovery_checks_bounded_reply_pages_and_saved_draft(self):
+        topic = self.make_uncertain('redpacket')
+        self.worker.clock = lambda: NOW + 300
+        first = page('redpacket').replace('回帖即领', '随机抽取') + '<a href="/t/123/page/2/#replies">2</a>'
+        last = page('redpacket', joined=True).replace('回帖即领', '随机抽取')
+        self.client.get.side_effect = [first, last]
+        self.worker.run([topic])
+        row = self.ledger.load()['entries']['123']
+        self.assertEqual(row['status'], 'confirmed')
+        self.assertFalse(row['submission_accepted'])
+        self.assertEqual(row['reply'], self.planner.prepare.return_value)
+        self.assertEqual(row['reply_source'], 'official_get')
+        self.assertEqual(self.client.get.call_args.args[0], '/t/123/page/2/')
+        self.client.post.assert_called_once(); self.planner.prepare.assert_called_once()
+
+    def test_query_failure_or_wrong_identity_stops_after_three_reads_and_survives_restart(self):
+        self.make_uncertain()
+        self.client.get.side_effect = [ParticipationError('page_unavailable'),
+                                     page(joined=True).replace('/u/7/', '/u/9/'), page()]
+        for delay in (300, 600, 900):
+            self.worker.clock = lambda: NOW + delay
+            self.worker.run([])
+        row = self.ledger.load()['entries']['123']
+        self.assertEqual((row['status'], row['confirmation_checks']), ('uncertain', 3))
+        count = self.client.get.call_count
+        fresh = Participant(self.ledger, self.client, self.planner, clock=lambda: NOW + 99999)
+        self.assertEqual(fresh.run([TOPIC]), {})
+        self.assertEqual(self.client.get.call_count, count)
+        self.client.post.assert_called_once(); self.planner.prepare.assert_called_once()
+
+    def test_large_random_history_does_not_trigger_bulk_confirmation(self):
+        self.make_uncertain('redpacket'); self.worker.clock = lambda: NOW + 300
+        first = page('redpacket').replace('回帖即领', '随机抽取') + '<a href="/t/123/page/6/#replies">6</a>'
+        self.client.get.side_effect = [first]
+        self.worker.run([])
+        row = self.ledger.load()['entries']['123']
+        self.assertEqual(row['confirmation_reason'], 'history_requires_review')
+        self.assertEqual(row['status'], 'uncertain'); self.assertEqual(self.client.get.call_count, 4)
+        self.client.post.assert_called_once()
+
+    def test_legacy_unknown_submission_without_saved_identity_remains_untouched(self):
+        row = dict(kind='lottery', status='uncertain', reason='post_unconfirmed', cost=10,
+                   day='2026-10-11', at=NOW - 99999, attempts=1)
+        self.ledger.save({'version': 1, 'entries': {'123': row}})
+        self.assertEqual(self.worker.run([TOPIC]), {})
+        self.assertEqual(self.ledger.load()['entries']['123'], row)
+        self.client.get.assert_not_called(); self.client.post.assert_not_called()
+
+
+class FinalReviewResponseTest(unittest.TestCase):
+    def test_malformed_distribution_and_wrong_selected_winner_fail_closed(self):
+        planner = ContentPlanner('synthetic-key', Mock())
+        base = {'type': 'choice', 'choice': 'ordinary_entry', 'confidence': .99,
+                'probabilities': {'ordinary_entry': .95, 'additional_action': .03, 'unclear': .02}}
+        invalid = [dict(base, probabilities={'ordinary_entry': .9}),
+                   dict(base, probabilities={'ordinary_entry': float('nan'), 'additional_action': .03, 'unclear': .02}),
+                   dict(base, probabilities={'ordinary_entry': True, 'additional_action': 0, 'unclear': 0}),
+                   dict(base, choice='additional_action'), dict(base, confidence='0.99')]
+        for answer in invalid:
+            response = MagicMock(); response.__enter__.return_value.read.return_value = json.dumps(
+                {'answers': {'requirement': answer}}).encode()
+            with patch('app.participation.urllib.request.build_opener') as opener:
+                opener.return_value.open.return_value = response
+                with self.assertRaises(ParticipationError) as error: planner.requirement_choice({'topic_body': '合成测试'})
+                self.assertEqual(error.exception.code, 'guard_unavailable')
+        response = MagicMock(); response.__enter__.return_value.read.return_value = json.dumps(
+            {'answers': {'requirement': base}}).encode()
+        with patch('app.participation.urllib.request.build_opener') as opener:
+            opener.return_value.open.return_value = response
+            self.assertEqual(planner.requirement_choice({'topic_body': '合成测试'})['choice'], 'ordinary_entry')
 
 
 if __name__ == '__main__': unittest.main()

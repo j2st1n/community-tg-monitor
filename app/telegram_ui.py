@@ -14,6 +14,9 @@ CST = timezone(timedelta(hours=8))
 PAGE_SIZE = 8
 REASONS = {
     "manual_requirements": "原帖有附加条件或参与要求不明确",
+    "final_review_denied": "第二轮终审未通过，已跳过",
+    "final_review_unclear": "第二轮终审仍不明确，已跳过",
+    "final_review_unavailable": "第二轮终审调用失败，已跳过",
     "unsafe_content": "原帖未通过内容安全或有效性检查",
     "reply_rejected": "生成回复未通过检查",
     "verification_required": "页面要求额外验证",
@@ -27,7 +30,7 @@ REASONS = {
     "guard_unavailable": "内容筛查暂不可用",
     "guard_not_configured": "内容筛查未配置",
     "reply_unavailable": "回复生成服务暂不可用",
-    "history_requires_review": "历史参与记录需人工核对",
+    "history_requires_review": "历史参与记录无法完整核验，已停止自动提交",
     "participation_error": "处理异常，具体原因未确认",
     "login_required": "论坛登录已失效",
 }
@@ -194,6 +197,7 @@ class TelegramUI:
         except Exception:
             lines.append("\n参与账本读取异常，统计暂不可用")
         lines += ["", "<i>查询确认不归因为程序提交；参与不代表中奖或到账。</i>"]
+        lines.append("资格初筛待定时只做一次 AI 终审；仍不明确或调用失败就跳过，不转人工。")
         return "\n".join(lines), kb([cb("待处理项目", "menu:review"), cb("历史记录", "list:history:0")],
                                       [cb("预算说明", "menu:budget"), cb("返回汇总", "menu:report")])
 
@@ -279,7 +283,7 @@ class TelegramUI:
         if status == "confirmed":
             return "程序提交已确认" if row.get("submission_accepted") is True else "账号查询确认已参与"
         return {"already": "账号已参与", "reserved": "提交结果未确认", "uncertain": "提交结果未确认",
-                "review": "等待人工处理", "retry": "等待重试", "waiting": "随机等待中", "skipped": "已跳过"}.get(status, "状态暂不可用")
+                "review": "旧策略待定记录", "retry": "等待重试", "waiting": "随机等待中", "skipped": "已跳过"}.get(status, "状态暂不可用")
 
     def format_review_item(self, kind, key, page):
         rows = self.nodeseek_ai_review if kind == "ai" else self.ledger_rows()
@@ -296,6 +300,12 @@ class TelegramUI:
                  f"发现时间：{stamp(row.get('queued_at') or row.get('at'))}",
                  f"记录更新时间：{stamp(row.get('quarantined_at') or row.get('at'))}"]
         diagnostic = row.get("diagnostics", {})
+        eligibility = diagnostic.get("eligibility", {})
+        if eligibility.get("first") in {"allow", "deny", "pending", "unavailable"}:
+            first = {"allow": "通过", "deny": "不通过", "pending": "待定", "unavailable": "调用失败"}[eligibility["first"]]
+            lines.append(f"资格初筛：{first}")
+            if eligibility.get("rounds") == 2:
+                lines.append("第二轮终审：" + ("通过" if eligibility.get("final") == "allow" else "未通过，已终止"))
         rules = diagnostic.get("reply_length_rules")
         if rules:
             lines.append(f"已记录字数要求：{e('；'.join(str(x) for x in rules), 240)}")

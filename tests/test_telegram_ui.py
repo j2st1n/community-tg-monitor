@@ -488,5 +488,27 @@ class PauseAndPrivateTest(BotCase):
         self.bot.send_msg.assert_not_called()
 
 
+class FinalEligibilityFeedbackTest(BotCase):
+    def test_terminal_review_feedback_is_literal_read_only_and_never_requests_manual_work(self):
+        for reason, expected in (("final_review_denied", "第二轮终审未通过"),
+                                 ("final_review_unclear", "第二轮终审仍不明确"),
+                                 ("final_review_unavailable", "第二轮终审调用失败")):
+            row = dict(kind="redpacket", status="skipped", cost=0, day="2026-10-15",
+                       at=self.now.timestamp(), title="<合成标题>&", reason=reason,
+                       diagnostics={"eligibility": {"rounds": 2, "first": "pending", "final": "skip"}})
+            self.bot.participant.ledger.save(dict(version=1, entries={"1": row}))
+            path = Path(self.bot.participant.ledger.path); before = path.read_bytes()
+            text, markup = self.bot.format_review_item("redpacket", "1", 0)
+            self.assertIn(expected, text)
+            self.assertIn("资格初筛：待定", text)
+            self.assertIn("第二轮终审：未通过，已终止", text)
+            self.assertNotIn("人工", text); parsed(text)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(any("重试" in b["text"] for r in markup["inline_keyboard"] for b in r))
+            card, _ = self.bot.format_participation_card()
+            self.assertIn("跳过：1 项", card)
+            self.assertIn("不转人工", card)
+
+
 if __name__ == "__main__":
     unittest.main()

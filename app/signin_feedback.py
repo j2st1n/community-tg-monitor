@@ -10,7 +10,8 @@ except ModuleNotFoundError:
 
 
 def signin_markup():
-    return keyboard([callback("查询资产", "signin:query"), url_button("查看签到页", "https://sb.sb/checkin/")])
+    return keyboard([callback("刷新查询", "signin:query"), url_button("查看签到页", "https://sb.sb/checkin/")],
+                    [callback("返回首页", "menu:status")])
 
 
 def format_signin(result, state, now, automatic=False):

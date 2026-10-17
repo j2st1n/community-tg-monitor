@@ -117,7 +117,7 @@ class FormattingTest(BotCase):
         self.bot.nodeseek_ai_review = {str(i): {"title": "<标题> &" * 100, "queued_at": self.now.timestamp(),
                                               "link": "https://example.invalid/"} for i in range(25)}
         cards = [self.bot.panel(name) for name in ("status", "report", "report_detail", "participation", "sources",
-                 "ai", "keywords", "review", "budget", "help", "help_detail")]
+                 "settings", "records", "keywords", "review", "budget", "help", "help_detail")]
         cards += [self.bot.format_keywords_card(1, True), self.bot.format_review_list("ai", 1)]
         for text, markup in cards:
             with self.subTest(title=text.splitlines()[0]):
@@ -155,24 +155,24 @@ class FormattingTest(BotCase):
 
 
 class InputAndButtonsTest(BotCase):
-    def test_invalid_model_keeps_state_then_correct_model_saves(self):
-        self.callback("ai:set_model")
-        self.command("bad model")
-        self.assertEqual(self.bot.user_states["100"], "waiting_for_ai_model")
-        self.command("gemini-3.8-flash-high")
-        self.assertEqual(self.bot.ai_model, "gemini-3.8-flash-high")
-        self.assertNotIn("100", self.bot.user_states)
-        self.assertNotIn("未识别", self.sent())
-        self.assertLess(len(self.sent()), 150)
+    def test_retired_ai_buttons_never_open_input_or_modify_server_configuration(self):
+        before = (self.bot.ai_model, self.bot.ai_judge_model, self.bot.ai_accept_threshold, self.bot.ai_enabled)
+        self.bot.test_ai_connection = Mock(side_effect=AssertionError("model_calls_forbidden"))
+        for data in ("ai:set_model", "ai:set_judge", "ai:set_threshold", "ai:set_endpoint", "ai:set_key", "ai:enabled:0", "ai:test", "menu:ai"):
+            self.callback(data)
+            self.assertNotIn("100", self.bot.user_states)
+            self.assertEqual(before, (self.bot.ai_model, self.bot.ai_judge_model, self.bot.ai_accept_threshold, self.bot.ai_enabled))
+            self.assertIn("服务器配置", self.bot.answer_callback_query.call_args.args[1])
+        self.bot.test_ai_connection.assert_not_called()
 
-    def test_cancel_and_navigation_end_input_without_changing_configuration(self):
-        self.callback("ai:set_model")
-        previous = self.bot.ai_model
+    def test_cancel_and_navigation_end_keyword_input_without_changing_configuration(self):
+        self.callback("menu:add_kw")
+        previous = self.bot.keywords[:]
         self.command("/cancel")
         self.assertNotIn("100", self.bot.user_states)
-        self.assertEqual(previous, self.bot.ai_model)
-        self.callback("ai:set_model")
-        self.callback("menu:status")
+        self.assertEqual(previous, self.bot.keywords)
+        self.callback("menu:add_kw")
+        self.callback("menu:records")
         self.assertNotIn("100", self.bot.user_states)
 
     def test_unknown_callback_acknowledges_without_mutation(self):
@@ -238,18 +238,18 @@ class InputAndButtonsTest(BotCase):
         self.assertIn("未添加新关注词", self.sent())
         self.assertNotIn("✅", self.sent())
 
-    def test_secret_save_and_deletion_have_independent_feedback(self):
-        self.callback("ai:set_key")
+    def test_stale_secret_input_never_saves_and_reports_deletion_result(self):
+        self.bot.user_states["100"] = "waiting_for_ai_key"
         self.command("synthetic-private-key")
-        self.assertIn("已保存", self.sent())
+        self.assertIn("未更改", self.sent())
         self.assertIn("删除失败", self.sent())
         self.assertNotIn("synthetic-private-key", self.sent())
-        self.assertNotIn("已删除", self.sent())
-        self.assertEqual(os.stat(main.AI_SECRET_FILE).st_mode & 0o777, 0o600)
+        self.assertFalse(Path(main.AI_SECRET_FILE).exists())
         self.bot.delete_msg.return_value = True
-        self.callback("ai:set_key")
+        self.bot.user_states["100"] = "waiting_for_ai_key"
         self.command("synthetic-replacement-key")
         self.assertIn("原消息已删除", self.sent())
+        self.assertFalse(Path(main.AI_SECRET_FILE).exists())
 
     def test_locked_secret_is_not_saved_and_delete_failure_is_not_hidden(self):
         self.bot.user_states["100"] = "waiting_for_ai_key"
@@ -259,38 +259,33 @@ class InputAndButtonsTest(BotCase):
         self.assertIn("删除失败", self.sent())
         self.assertFalse(Path(main.AI_SECRET_FILE).exists())
 
-    def test_secret_save_error_still_reports_original_message_deletion_result(self):
-        self.callback("ai:set_key")
-        with patch.object(self.bot, "save_ai_secret", side_effect=OSError("synthetic-private")):
+    def test_stale_secret_input_never_invokes_secret_writer(self):
+        self.bot.user_states["100"] = "waiting_for_ai_key"
+        with patch.object(self.bot, "save_ai_secret", side_effect=AssertionError("writer_forbidden")) as writer:
             self.command("synthetic-secret")
-        self.assertIn("保存结果未确认", self.sent())
-        self.assertIn("删除失败", self.sent())
-        self.assertNotIn("synthetic-private", self.sent())
-        self.assertIn("100", self.bot.user_states)
+        writer.assert_not_called()
+        self.assertIn("未更改", self.sent())
+        self.assertNotIn("synthetic-secret", self.sent())
+        self.assertNotIn("100", self.bot.user_states)
 
-    def test_setting_save_failure_keeps_previous_value_and_input_mode(self):
-        self.bot.ai_model = "previous"
-        self.callback("ai:set_model")
+    def test_keyword_save_failure_keeps_previous_value_and_input_mode(self):
+        previous = self.bot.keywords[:]
+        self.callback("menu:add_kw")
         with patch.object(self.bot, "save_settings", side_effect=OSError("synthetic-private")):
             self.command("replacement")
-        self.assertEqual(self.bot.ai_model, "previous")
-        self.assertIn("保存失败", self.sent())
-        self.assertEqual(self.bot.user_states["100"], "waiting_for_ai_model")
+        self.assertEqual(self.bot.keywords, previous)
+        self.assertEqual(self.bot.user_states["100"], "waiting_for_add")
+        self.assertNotIn("synthetic-private", self.sent())
 
-    def test_all_locked_fields_refuse_callback_and_pending_input(self):
-        for field, env, state, value in (("endpoint", "env_ai_endpoint", "waiting_for_ai_endpoint", "https://example.invalid/v1"),
-                ("model", "env_ai_model", "waiting_for_ai_model", "locked-model"),
-                ("judge", "env_ai_judge_model", "waiting_for_ai_judge", "locked-judge"),
-                ("threshold", "env_ai_accept_threshold", "waiting_for_ai_threshold", .9)):
-            with self.subTest(field=field):
-                setattr(self.bot, env, value)
-                self.callback("ai:set_" + field)
-                self.assertNotIn("100", self.bot.user_states)
-                self.assertIn("服务器配置", self.sent())
-                self.bot.user_states["100"] = state
-                self.command("0.85" if field == "threshold" else "replacement")
-                self.assertIn("服务器配置", self.sent())
-                self.assertNotIn("已保存", self.sent())
+    def test_all_old_ai_input_modes_are_retired_even_without_environment_locks(self):
+        for state, attribute in (("waiting_for_ai_endpoint", "ai_endpoint"), ("waiting_for_ai_model", "ai_model"),
+                                 ("waiting_for_ai_judge", "ai_judge_model"), ("waiting_for_ai_threshold", "ai_accept_threshold")):
+            previous = getattr(self.bot, attribute)
+            self.bot.user_states["100"] = state
+            self.command("replacement")
+            self.assertEqual(getattr(self.bot, attribute), previous)
+            self.assertNotIn("100", self.bot.user_states)
+            self.assertIn("服务器配置", self.sent())
 
     def test_ai_disable_survives_restart_with_environment_credentials(self):
         with patch.dict(os.environ, {"AI_ENDPOINT": "https://example.invalid/v1", "AI_MODEL": "synthetic-model", "AI_API_KEY": "synthetic-key"}):
@@ -305,17 +300,15 @@ class InputAndButtonsTest(BotCase):
             restarted = main.BotManager()
         self.assertFalse(restarted.ai_enabled)
 
-    def test_default_ai_panel_never_exposes_endpoint_or_key_and_test_enum_is_translated(self):
+    def test_settings_and_legacy_commands_never_expose_server_configuration_or_run_tests(self):
         self.bot.ai_endpoint = "https://private.invalid/v1"
         self.bot.ai_api_key = "synthetic-sensitive-key"
-        self.bot.ai_model = "gemini-3.8-flash-high"
-        text, _ = self.bot.format_ai_card()
-        self.assertNotIn("private.invalid", text)
-        self.assertNotIn("synthetic-sensitive-key", text)
-        self.bot.test_ai_connection = lambda: {"event_state": "open", "confidence": .95}
-        self.callback("ai:test")
-        self.assertIn("活动进行中", self.sent())
-        self.assertNotIn(">open<", self.sent())
+        self.bot.test_ai_connection = Mock()
+        for command in ("/settings", "/sources", "/ai", "/test"):
+            self.command(command)
+            self.assertNotIn("private.invalid", self.sent())
+            self.assertNotIn("synthetic-sensitive-key", self.sent())
+        self.bot.test_ai_connection.assert_not_called()
 
 
 class StatisticsAndDetailTest(BotCase):
@@ -347,53 +340,67 @@ class StatisticsAndDetailTest(BotCase):
         self.assertNotIn("签到：已完成", text)
         self.assertNotIn("运行中", text)
 
-    def test_ledger_detail_is_read_only_and_preserves_submission_attribution(self):
+    def test_all_outcomes_are_queryable_without_mutation_or_false_submission_attribution(self):
         rows = {
             "1": dict(kind="redpacket", status="confirmed", submission_accepted=False, cost=0,
-                      day="2026-10-15", at=self.now.timestamp(), title="查询确认"),
+                      day="2026-10-15", at=self.now.timestamp(), title="查询确认", reply="未单独核实的旧回复"),
             "2": dict(kind="lottery", status="confirmed", submission_accepted=True, cost=10,
                       day="2026-10-15", at=self.now.timestamp(), title="程序提交"),
-            "3": dict(kind="redpacket", status="review", cost=0, day="2026-10-15", at=self.now.timestamp(),
-                      title="<需处理>&", reason="manual_requirements", diagnostics={"reply_length_rules": ["不少于20字"]}),
-            "4": dict(kind="redpacket", status="uncertain", cost=0, day="2026-10-14", at=self.now.timestamp(), title="旧未确认")}
+            "3": dict(kind="redpacket", status="skipped", cost=0, day="2026-10-15", at=self.now.timestamp(),
+                      title="<已跳过>&", reason="final_review_unclear", topic_body="<帖子正文>&", diagnostics={"eligibility":{"first":"pending","rounds":2,"final":"skip"}}),
+            "4": dict(kind="redpacket", status="uncertain", cost=0, day="2026-10-14", at=self.now.timestamp(), title="旧提交异常", attempted_reply="拟发文案")}
         self.bot.participant.ledger.save(dict(version=1, entries=rows))
-        path = Path(self.bot.participant.ledger.path)
-        before = path.read_bytes()
+        path = Path(self.bot.participant.ledger.path); before = path.read_bytes()
+        self.bot.participant.run = Mock(side_effect=AssertionError("no_participation"))
+        self.bot.participant.reconcile_pending = Mock(side_effect=AssertionError("no_state_recovery"))
         report = self.bot.generate_daily_report_card()
-        self.assertIn("烧饼抽奖：提交确认 1 项 · 查询确认 0 项", report)
-        self.assertIn("烧饼红包：提交确认 0 项 · 查询确认 1 项", report)
-        self.assertIn("结果未确认 0 项", report)
-        index, _ = self.bot.format_review_index()
-        self.assertIn("历史活动待处理 / 未确认：1", index)
-        _, markup = self.bot.format_review_list("redpacket")
-        self.callback(markup["inline_keyboard"][0][0]["callback_data"])
-        detail = self.bot.edit_msg_text.call_args.args[2]
-        self.assertIn("不少于20字", detail)
+        for text in ("自动参与成功：1 项", "账号查询确认已参与：1 项", "已跳过：1 项", "提交异常：0 项"):
+            self.assertIn(text, report)
+        listing, markup = self.bot.format_records_card()
+        self.assertEqual(len([b for row in markup['inline_keyboard'] for b in row if b.get('callback_data','').startswith('ui:')]), 4)
+        for row in markup['inline_keyboard']:
+            for b in row:
+                if b.get('callback_data','').startswith('ui:'):
+                    self.callback(b['callback_data'])
+                    detail=self.bot.edit_msg_text.call_args.args[2]
+                    parsed(detail)
+                    self.assertIn("发布时间：暂未获取", detail)
+                    self.assertIn("回复时间：暂未获取", detail)
+                    self.assertNotIn("等待人工", detail)
+        error,_=self.bot.format_record_item("4")
+        self.assertIn("提交异常", error); self.assertIn("拟提交回复", error); self.assertIn("不重复提交", error)
+        self.assertNotIn("结果待确认", error)
+        skipped,_=self.bot.format_record_item("3")
+        self.assertIn("第二轮终审仍不明确，已跳过", skipped); self.assertIn("&lt;帖子正文&gt;&amp;", skipped)
+        query,_=self.bot.format_record_item("1")
+        self.assertIn("未单独核实", query); self.assertIn("不能据此认定由本程序提交", query)
         self.assertEqual(path.read_bytes(), before)
-        for row in self.bot.edit_msg_text.call_args.kwargs["reply_markup"]["inline_keyboard"]:
-            for button in row:
-                self.assertNotIn("重试", button["text"])
-                self.assertNotIn("参与", button["text"])
+        self.bot.participant.run.assert_not_called(); self.bot.participant.reconcile_pending.assert_not_called()
 
-    def test_old_ai_entries_are_paged_and_unknown_dates_not_counted_as_today(self):
-        self.bot.nodeseek_ai_review = {str(i): {"title": f"标题{i}", "queued_at": (self.now - timedelta(days=10)).timestamp(),
-                                     "last_error": "HTTP 503", "link": "https://example.invalid/"} for i in range(177)}
-        self.bot.nodeseek_ai_review["unknown"] = {"title": "未记录日期"}
-        index, _ = self.bot.format_review_index()
-        self.assertIn("今日新增复核：0", index)
-        self.assertIn("历史存量：177", index)
-        self.assertIn("日期未确认：1", index)
-        text, markup = self.bot.format_review_list("ai", 1)
-        self.assertIn("2 / 23", text)
-        self.assertLess(units(text), 4096)
-        self.assertTrue(any(button["text"] == "下一页" for row in markup["inline_keyboard"] for button in row))
+    def test_record_paging_keeps_all_dates_and_does_not_expose_legacy_ai_queue(self):
+        self.bot.nodeseek_ai_review = {"old": {"title": "legacy-ai-private", "last_error": "HTTP 503"}}
+        rows={str(i):dict(kind="redpacket",status="skipped",cost=0,day="2026-10-14",at=self.now.timestamp()+i,title=f"标题{i}") for i in range(1,18)}
+        self.bot.participant.ledger.save(dict(version=1,entries=rows))
+        before=dict(self.bot.nodeseek_ai_review)
+        text,markup=self.bot.format_records_card(1)
+        self.assertIn("2 / 3",text); self.assertIn("共 17 项",text)
+        self.assertNotIn("legacy-ai-private",text)
+        self.assertTrue(any(b['text']=='下一页' for row in markup['inline_keyboard'] for b in row))
+        self.assertEqual(self.bot.nodeseek_ai_review,before)
+        self.assertLess(units(text),4096)
 
-    def test_help_exposes_ai_report_cancel_and_private_capability(self):
-        help_text, _ = self.bot.format_help()
-        for value in ("/ai", "/report", "/cancel"):
-            self.assertIn(value, help_text)
-        details, _ = self.bot.format_help(True)
-        self.assertIn("已有对话的新消息不保证提醒", details)
+    def test_home_has_four_daily_entries_and_settings_only_has_business_switches(self):
+        text, markup = self.bot.format_status_card()
+        self.assertEqual([b['text'] for row in markup['inline_keyboard'] for b in row],['签到与资产','今日汇总','参与记录','设置'])
+        settings, markup = self.bot.format_sources_card()
+        actions=[b.get('callback_data','') for row in markup['inline_keyboard'] for b in row]
+        self.assertEqual(sum(a.startswith(('source:','participation:')) for a in actions),3)
+        self.assertFalse(any(a.startswith('ai:') or a in {'menu:pause','menu:resume','menu:review'} for a in actions))
+        help_text, _=self.bot.format_help()
+        for word in ('/settings','/records','/signin','/report'):
+            self.assertIn(word,help_text)
+        for word in ('/ai','/test','/pause','API','复审模型'):
+            self.assertNotIn(word,help_text+settings+text)
 
 
 class PauseAndPrivateTest(BotCase):
@@ -500,14 +507,86 @@ class FinalEligibilityFeedbackTest(BotCase):
             path = Path(self.bot.participant.ledger.path); before = path.read_bytes()
             text, markup = self.bot.format_review_item("redpacket", "1", 0)
             self.assertIn(expected, text)
-            self.assertIn("资格初筛：待定", text)
-            self.assertIn("第二轮终审：未通过，已终止", text)
+            self.assertNotIn("资格初筛：待定", text)
+            self.assertIn("已跳过", text)
             self.assertNotIn("人工", text); parsed(text)
             self.assertEqual(path.read_bytes(), before)
             self.assertFalse(any("重试" in b["text"] for r in markup["inline_keyboard"] for b in r))
             card, _ = self.bot.format_participation_card()
-            self.assertIn("跳过：1 项", card)
-            self.assertIn("不转人工", card)
+            self.assertIn("已跳过", card)
+            self.assertNotIn("待人工", card)
+
+
+class DailyMenuRoutingTest(BotCase):
+    def test_signin_commands_and_button_are_query_only(self):
+        self.bot.query_signin = Mock()
+        for cmd in ("/signin", "/checkin"):
+            self.command(cmd)
+            self.bot.query_signin.assert_called_with("100", allow_submit=False)
+        self.callback("signin:query")
+        self.bot.query_signin.assert_called_with("100", allow_submit=False)
+        self.assertEqual(self.bot.query_signin.call_count, 3)
+        from app.signin_feedback import signin_markup
+        self.assertIn("menu:status", [b.get("callback_data") for row in signin_markup()["inline_keyboard"] for b in row])
+
+    def test_combined_pause_buttons_expire_without_changing_runtime(self):
+        self.bot.paused = False
+        for callback in ("menu:pause", "menu:resume"):
+            self.callback(callback)
+            self.assertFalse(self.bot.paused)
+            self.assertIn("状态开关", self.bot.answer_callback_query.call_args.args[1])
+        self.bot.paused = True
+        text, markup = self.bot.format_sources_card()
+        self.assertIn("/resume", text)
+        self.assertFalse(any(b.get("callback_data") in {"menu:pause", "menu:resume"} for row in markup["inline_keyboard"] for b in row))
+
+    def test_registered_commands_only_offer_settings_and_queries(self):
+        self.assertEqual([x["command"] for x in main.BOT_COMMANDS], ["status", "signin", "report", "records", "settings"])
+        for cmd, title in (("/settings", "设置"), ("/records", "参与记录"), ("/start", "运行状态")):
+            self.command(cmd)
+            self.assertIn(title, self.sent())
+
+    def test_corrupt_ledger_is_reported_not_presented_as_empty(self):
+        path = Path(self.bot.participant.ledger.path)
+        path.write_text("{broken")
+        text, _ = self.bot.format_records_card()
+        self.assertIn("读取失败", text)
+        self.assertNotIn("共 0 项", text)
+        self.assertEqual(path.read_text(), "{broken")
+
+    def test_long_record_data_is_literal_bounded_and_callbacks_are_short(self):
+        row = dict(kind="redpacket", status="uncertain", cost=0, day="2026-10-15", at=self.now.timestamp(),
+                   title="<标题>&" * 1500, topic_body="<正文>&🍪" * 4000, attempted_reply="<拟发>&🍪" * 3000)
+        self.bot.participant.ledger.save(dict(version=1, entries={"1": row}))
+        text, markup = self.bot.format_record_item("1")
+        self.assertLess(units("".join(parsed(text).text)), 4096)
+        self.assertIn("拟提交回复", text)
+        self.assertNotIn("已核实回复", text)
+        for group in markup['inline_keyboard']:
+            for b in group:
+                if 'callback_data' in b:
+                    self.assertLessEqual(len(b['callback_data'].encode()), 64)
+
+    def test_durable_submission_in_progress_is_not_reported_as_an_exception(self):
+        self.bot.participant.ledger.save(dict(version=1, entries={"1":dict(kind="redpacket",status="reserved",cost=0,day="2026-10-15",at=self.now.timestamp(),title="提交中")}))
+        before = Path(self.bot.participant.ledger.path).read_bytes()
+        text = self.bot.generate_daily_report_card()
+        self.assertIn("提交异常：0 项", text)
+        self.assertIn("提交中：1 项", text)
+        detail, _ = self.bot.format_record_item("1")
+        self.assertIn("状态：提交中", detail)
+        self.assertIn("保留防重", detail)
+        self.assertEqual(Path(self.bot.participant.ledger.path).read_bytes(), before)
+
+    def test_record_tokens_expire_and_do_not_query_or_mutate_any_activity(self):
+        self.bot.participant.ledger.save(dict(version=1, entries={"1":dict(kind="redpacket",status="skipped",cost=0,day="2026-10-15",at=self.now.timestamp(),title="示例")}))
+        _, markup = self.bot.format_records_card()
+        token = markup['inline_keyboard'][0][0]['callback_data']
+        self.bot.ui_actions.clear()
+        self.callback(token)
+        self.assertIn("过期", self.bot.answer_callback_query.call_args.args[1])
+        with self.assertRaises(ValueError):
+            self.bot.format_record_item("../settings")
 
 
 if __name__ == "__main__":

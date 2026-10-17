@@ -396,22 +396,18 @@ class ContentPlanner:
             "additional_action": "An explicit condition for entering or receiving THIS forum prize requires another action beyond the official entry method, such as purchase, external registration, following, sharing, group membership, proof, qualification, mandatory experience or prescribed reply wording. The condition is tied to this forum prize, rather than only to a separate advertised offer.",
             "unclear": "Conditions for THIS forum activity are explicitly missing, hidden, contradictory, or ambiguous about which prize they apply to. The supplied evidence cannot distinguish normal entry from an additional forum prerequisite."
         }
-        payload = {"model": "jev-latest", "state": state, "questions": {"requirement": {
-            "type": "choice", "instructions": "What must a member do to enter or claim the forum activity in forum_activity? Read the full topic_title/topic_body, the verified official widget, and requirement_text (which removes only executable reply-length clauses). Identify which benefit each instruction concerns. Classify requirements for the sb.sb forum prize; product trials and external token credits can be separate benefits advertised in the same post. Use an explicit relationship to decide whether an external step is a forum prerequisite.", "criteria": criteria}}}
-        req = urllib.request.Request("https://api.typesafe.ai/v1/systemone",
-            data=json.dumps(payload, ensure_ascii=False).encode(), method="POST",
-            headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         try:
-            with urllib.request.build_opener(NoRedirect).open(req, timeout=25) as r: result = json.loads(r.read(65536))
-            answer = result["answers"]["requirement"]
-            if answer["type"] != "choice" or answer["choice"] not in criteria: raise ValueError()
-            probabilities = answer["probabilities"]
-            if set(probabilities) != set(criteria): raise ValueError()
-            for v in [answer["confidence"], *probabilities.values()]:
-                if type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1: raise ValueError()
-            if abs(sum(probabilities.values()) - 1) > .02: raise ValueError()
-            if probabilities[answer["choice"]] != max(probabilities.values()): raise ValueError()
-            return {k: answer[k] for k in ("choice", "confidence", "probabilities")}
+            model = self.classifier_factory()
+            sources = {key: state.get(key, "") for key in ("topic_title", "topic_body")}
+            sources["forum_activity.widget_instructions"] = state.get("forum_activity", {}).get("widget_instructions", "")
+            result = model.final_decision(state,
+                "What must a member do to enter or claim THIS sb.sb forum activity? Read the full original title/body, "
+                "the independently verified official widget and requirement_text (code has already handled executable reply-length rules). "
+                "Identify which benefit each instruction concerns. An external product trial/token credit and this forum prize can be separate offers. "
+                "Only an explicit relationship makes an external action a forum prerequisite. Optional support or discussion is not a prerequisite. "
+                "Choose ordinary_entry only when normal official entry is sufficient; additional_action for explicit extra requirements, otherwise unclear.",
+                sources, criteria)
+            return {"choice": result["decision"], "evidence": result["evidence"], "model": model.model}
         except Exception: raise ParticipationError("guard_unavailable")
 
     def prepare(self, title, topic_body, kind, *, forum_activity=None):
@@ -468,9 +464,8 @@ class ContentPlanner:
             except ParticipationError as e:
                 raise ParticipationError("final_review_unavailable", details) from e
             details["requirement_decision"] = decision
-            probabilities = decision["probabilities"]
-            permitted = (decision["choice"] == "ordinary_entry" and probabilities["ordinary_entry"] >= .80
-                         and probabilities["additional_action"] <= .20 and probabilities["unclear"] <= .10)
+            details["review_models"] = {"first": "jev-latest", "final": decision.get("model", "configured_primary")}
+            permitted = decision["choice"] == "ordinary_entry"
             if not permitted:
                 details["rejection"] = "final_review_denied" if decision["choice"] == "additional_action" else "final_review_unclear"
                 raise ParticipationError(details["rejection"], details)
@@ -588,7 +583,9 @@ class Ledger:
             groups[row["kind"]][field] += 1
         used, count = self.usage(state, day)
         return {"groups": groups, "reserved_cost": used, "reserved_count": count,
-                "waiting": sum(r["status"] == "waiting" for r in state["entries"].values())}
+                "waiting": sum(r["status"] == "waiting" for r in state["entries"].values()),
+                "submitting": sum(r["day"] == day and r.get("kind") in groups and r["status"] == "reserved"
+                                  for r in state["entries"].values())}
 
 
 class Participant:
@@ -740,6 +737,7 @@ class Participant:
         reserved = False
         try:
             page = TopicPage(self.client.get(path), kind)
+            row["topic_body"] = page.body[:8000]
             plan = page.plan(path, now)
             if kind == "redpacket" and "随机抽取" in page.meta:
                 self.check_random_history(page, path, plan["uid"])
@@ -840,13 +838,18 @@ class Participant:
             if other.already(): raise ParticipationError("already")
 
 
-def build_participant(data_dir, cookie, classifier_factory):
-    enabled = os.environ.get("SBSB_AUTO_PARTICIPATE", "0").lower() in ("1", "true", "yes")
+def load_typesafe_key():
     key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     key_file = os.environ.get("TYPESAFE_API_KEY_FILE", "")
     if not key and key_file:
         try:
             with open(key_file, encoding="utf-8") as f: key = f.read().strip()
         except OSError: pass
+    return key
+
+
+def build_participant(data_dir, cookie, classifier_factory):
+    enabled = os.environ.get("SBSB_AUTO_PARTICIPATE", "0").lower() in ("1", "true", "yes")
+    key = load_typesafe_key()
     return Participant(Ledger(os.path.join(data_dir, "sbsb_participation.json")), ForumClient(cookie),
                        ContentPlanner(key, classifier_factory), enabled=enabled and bool(cookie))

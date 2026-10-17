@@ -146,6 +146,7 @@ class AIQueueIntegrationTest(unittest.TestCase):
         }
         bot.nodeseek_ai_history = []
         bot.nodeseek_ai_review = {}
+        bot.nodeseek_ai_history = []
         bot.seen_ids = set()
         bot.seen_id_order = []
         bot.stats = {}
@@ -172,7 +173,7 @@ class AIQueueIntegrationTest(unittest.TestCase):
             "evidence": ["送小鸡"],
             "reviewed": False,
         }
-        bot.build_ai_classifier = MagicMock(return_value=mock_classifier)
+        bot.build_nodeseek_classifier = MagicMock(return_value=mock_classifier)
 
         with patch("app.main.deliver_public_match") as mock_deliver:
             main.process_nodeseek_ai_queue(bot)
@@ -183,7 +184,7 @@ class AIQueueIntegrationTest(unittest.TestCase):
             self.assertEqual(1, bot.stats.get("ai_giveaway_hits"))
             mock_deliver.assert_called_once()
 
-    def test_failed_post_is_quarantined_at_retry_limit(self):
+    def test_failed_post_is_closed_without_manual_queue(self):
         bot = main.BotManager.__new__(main.BotManager)
         bot.lock = threading.RLock()
         bot.ai_enabled = True
@@ -200,6 +201,7 @@ class AIQueueIntegrationTest(unittest.TestCase):
             }
         }
         bot.nodeseek_ai_review = {}
+        bot.nodeseek_ai_history = []
         bot.seen_ids = set()
         bot.seen_id_order = []
         bot.save_nodeseek_ai_state = MagicMock()
@@ -207,13 +209,13 @@ class AIQueueIntegrationTest(unittest.TestCase):
         bot.record_stat = MagicMock()
         classifier = MagicMock()
         classifier.classify.side_effect = AIClassificationError("missing content")
-        bot.build_ai_classifier = MagicMock(return_value=classifier)
+        bot.build_nodeseek_classifier = MagicMock(return_value=classifier)
 
         with patch("app.main.deliver_public_match") as deliver:
             main.process_nodeseek_ai_queue(bot)
         self.assertNotIn("nodeseek:200", bot.nodeseek_ai_pending)
-        self.assertIn("nodeseek:200", bot.nodeseek_ai_review)
-        self.assertEqual(main.MAX_AI_RETRY_ATTEMPTS, bot.nodeseek_ai_review["nodeseek:200"]["attempts"])
+        self.assertEqual({}, bot.nodeseek_ai_review)
+        self.assertEqual("classification_unavailable", bot.nodeseek_ai_history[-1]["error"])
         self.assertIn("nodeseek:200", bot.seen_ids)
         self.assertFalse(bot.queue_nodeseek_post("nodeseek:200", "", "", "", "", ""))
         bot.save_nodeseek_ai_state.assert_called_once()
@@ -232,17 +234,19 @@ class AIQueueIntegrationTest(unittest.TestCase):
             "nodeseek:old": {"title": "旧帖", "attempts": main.MAX_AI_RETRY_ATTEMPTS, "next_retry_at": 0}
         }
         bot.nodeseek_ai_review = {}
+        bot.nodeseek_ai_history = []
         bot.seen_ids = set()
         bot.seen_id_order = []
         bot.save_nodeseek_ai_state = MagicMock()
         bot.save_seen_ids = MagicMock()
         bot.record_stat = MagicMock()
         classifier = MagicMock()
-        bot.build_ai_classifier = MagicMock(return_value=classifier)
+        bot.build_nodeseek_classifier = MagicMock(return_value=classifier)
 
         main.process_nodeseek_ai_queue(bot)
         classifier.classify.assert_not_called()
-        self.assertIn("nodeseek:old", bot.nodeseek_ai_review)
+        self.assertEqual({}, bot.nodeseek_ai_review)
+        self.assertEqual("nodeseek:old", bot.nodeseek_ai_history[-1]["id"])
         self.assertIn("nodeseek:old", bot.seen_ids)
 
     def test_review_queue_survives_state_reload(self):

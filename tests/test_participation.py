@@ -156,6 +156,7 @@ class PipelineTest(unittest.TestCase):
         state = self.ledger.load()
         self.assertEqual(state['entries']['123']['cost'], 10)
         self.assertEqual(state['entries']['123']['displayed_fee'], 1)
+        self.assertEqual(state['entries']['123']['topic_body'], '休息日，大家来吃饼。')
         self.assertNotIn("synthetic-csrf", json.dumps(state))
         fresh = Participant(self.ledger, self.client, self.planner, clock=lambda: NOW + 100)
         self.assertEqual(fresh.run([TOPIC]), {})
@@ -752,14 +753,12 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(e.exception.code, 'final_review_unavailable')
         self.assertEqual(e.exception.diagnostics['guard_stage'], 'eligibility_final'); model._chat.assert_not_called()
 
-    def test_requirement_probability_distribution_controls_contextual_review(self):
-        for probabilities, expected in [({'ordinary_entry': .82, 'additional_action': .17, 'unclear': .01}, True),
-                                        ({'ordinary_entry': .79, 'additional_action': .20, 'unclear': .01}, False),
-                                        ({'ordinary_entry': .82, 'additional_action': .06, 'unclear': .12}, False)]:
+    def test_final_decision_controls_review_without_fabricated_probabilities(self):
+        for verdict, expected in [('ordinary_entry', True), ('additional_action', False), ('unclear', False)]:
             p, model = self.make_planner()
             p.noul.side_effect = [{'injection': .01, 'relevant': .99, 'additional': .24},
                                  {'invented': .01, 'unsafe': .01, 'relevant': .99}]
-            p.requirement_choice.return_value = {'choice': 'ordinary_entry', 'confidence': .73, 'probabilities': probabilities}
+            p.requirement_choice.return_value = {'choice': verdict, 'evidence': [{'field':'topic_body','quote':'先号后款'}]}
             if expected: self.assertEqual(p.prepare('买卖帖', '先号后款', 'redpacket'), '周末来领份饼，感谢分享！')
             else:
                 with self.assertRaises(ParticipationError): p.prepare('买卖帖', '先号后款', 'redpacket')
@@ -1044,6 +1043,7 @@ class ParticipationReportTest(unittest.TestCase):
             self.assertEqual(report['groups']['lottery'], dict(submitted=1, account_joined=0,
                 unconfirmed=1, skipped=0, review=0, retry=1))
             self.assertEqual((report['reserved_cost'], report['reserved_count'], report['waiting']), (20, 5, 1))
+            self.assertEqual(report['submitting'], 1)
             with open(ledger.path, 'rb') as f: self.assertEqual(f.read(), before)
 
 
@@ -1083,12 +1083,12 @@ class ParticipationControlsTest(unittest.TestCase):
         with patch.object(self.main.BotManager, 'get_today_cst', return_value='2026-10-12'):
             report = self.bot.generate_daily_report_card()
         self.assertIn('2026-10-12', report)
-        self.assertIn('烧饼抽奖：提交确认 0 项', report)
+        self.assertIn('自动参与成功：0 项', report)
         self.assertIn('抽奖预算预留：0 / 50 饼', report)
         self.assertNotIn('提交预留', report)
         with patch.object(self.main.BotManager, 'get_today_cst', return_value='2026-10-11'):
             same_day = self.bot.generate_daily_report_card()
-        self.assertIn('烧饼抽奖：提交确认 1 项', same_day)
+        self.assertIn('自动参与成功：1 项', same_day)
         self.assertIn('抽奖预算预留：10 / 50 饼', same_day)
         self.assertEqual(self.client.post.call_count, 1)
 
@@ -1096,14 +1096,14 @@ class ParticipationControlsTest(unittest.TestCase):
         with open(self.worker.ledger.path, 'w') as f: f.write('{broken')
         report = self.bot.generate_daily_report_card()
         self.assertIn('参与账本读取异常，统计暂不可用', report)
-        self.assertNotIn('烧饼抽奖：提交确认 0 项', report)
+        self.assertNotIn('自动参与成功：0 项', report)
         self.client.get.assert_not_called()
 
     def test_report_warns_missing_guard_and_preserves_statistics(self):
         self.worker.planner = ContentPlanner('', lambda: None)
         report = self.bot.generate_daily_report_card()
         self.assertIn('安全筛查未配置，当前无法自动参与', report)
-        self.assertIn('烧饼抽奖：提交确认 0 项', report)
+        self.assertIn('自动参与成功：0 项', report)
 
     def test_muted_notifications_still_execute_participation(self):
         self.bot.toggle_source('sbsb')
@@ -1198,8 +1198,8 @@ class ParticipationControlsTest(unittest.TestCase):
         self.assertFalse(self.bot.sbsb_participation_enabled)
         self.assertTrue(self.bot.is_source_enabled('sbsb'))
         text, markup = self.bot.format_sources_card()
-        self.assertIn('烧饼自动参与：关', text)
-        self.assertIn('关闭活动推送仍可自动参与', text)
+        self.assertIn('烧饼自动参与：关', ' '.join(b['text'] for row in markup['inline_keyboard'] for b in row))
+        self.assertIn('烧饼通知关闭不影响自动参与', text)
         callbacks = [b['callback_data'] for row in markup['inline_keyboard'] for b in row]
         self.assertIn('participation:1', callbacks)
         self.assertIn('source:sbsb:0', callbacks)
@@ -1380,26 +1380,32 @@ class FinalReviewLifecycleTest(unittest.TestCase):
 
 
 class FinalReviewResponseTest(unittest.TestCase):
-    def test_malformed_distribution_and_wrong_selected_winner_fail_closed(self):
-        planner = ContentPlanner('synthetic-key', Mock())
-        base = {'type': 'choice', 'choice': 'ordinary_entry', 'confidence': .99,
-                'probabilities': {'ordinary_entry': .95, 'additional_action': .03, 'unclear': .02}}
-        invalid = [dict(base, probabilities={'ordinary_entry': .9}),
-                   dict(base, probabilities={'ordinary_entry': float('nan'), 'additional_action': .03, 'unclear': .02}),
-                   dict(base, probabilities={'ordinary_entry': True, 'additional_action': 0, 'unclear': 0}),
-                   dict(base, choice='additional_action'), dict(base, confidence='0.99')]
-        for answer in invalid:
-            response = MagicMock(); response.__enter__.return_value.read.return_value = json.dumps(
-                {'answers': {'requirement': answer}}).encode()
-            with patch('app.participation.urllib.request.build_opener') as opener:
-                opener.return_value.open.return_value = response
-                with self.assertRaises(ParticipationError) as error: planner.requirement_choice({'topic_body': '合成测试'})
-                self.assertEqual(error.exception.code, 'guard_unavailable')
-        response = MagicMock(); response.__enter__.return_value.read.return_value = json.dumps(
-            {'answers': {'requirement': base}}).encode()
-        with patch('app.participation.urllib.request.build_opener') as opener:
-            opener.return_value.open.return_value = response
-            self.assertEqual(planner.requirement_choice({'topic_body': '合成测试'})['choice'], 'ordinary_entry')
+    def test_final_reviewer_uses_shared_gemini_and_only_original_sources(self):
+        from app.ai_classifier import OpenAICompatibleClassifier
+        model = OpenAICompatibleClassifier('https://synthetic.example/v1', 'synthetic-key', 'gemini-3.8-flash-high', 'obsolete-judge')
+        model._chat = Mock(return_value={'decision': 'ordinary_entry', 'evidence': [{'field': 'topic_body', 'quote': '回帖即领'}]})
+        planner = ContentPlanner('separate-synthetic-key', lambda: model)
+        with patch('app.participation.urllib.request.build_opener') as jev:
+            result = planner.requirement_choice({'topic_title': '红包', 'topic_body': '回帖即领'})
+        self.assertEqual(result['choice'], 'ordinary_entry')
+        self.assertEqual(result['model'], 'gemini-3.8-flash-high')
+        self.assertEqual(model._chat.call_args.args[1], model.model)
+        self.assertFalse(model._chat.call_args.kwargs['allow_format_retry'])
+        jev.assert_not_called()
+
+    def test_malformed_or_fabricated_evidence_fails_closed(self):
+        from app.ai_classifier import OpenAICompatibleClassifier
+        model = OpenAICompatibleClassifier('https://synthetic.example/v1', 'synthetic-key', 'gemini-3.8-flash-high')
+        planner = ContentPlanner('synthetic-key', lambda: model)
+        for raw in ({'decision': 'ordinary_entry', 'evidence': []},
+                    {'decision': 'ordinary_entry', 'evidence': [{'field':'topic_body','quote':'虚构'}]},
+                    {'decision': 'ordinary_entry', 'evidence': [{'field':'cookie','quote':'x'}]},
+                    {'decision': 'ordinary_entry', 'evidence': [{'field':'topic_body','quote':'回帖'}], 'confidence':.99},
+                    {'decision': 'allow', 'evidence': [{'field':'topic_body','quote':'回帖'}]}):
+            model._chat = Mock(return_value=raw)
+            with self.assertRaises(ParticipationError) as error:
+                planner.requirement_choice({'topic_body': '回帖即领'})
+            self.assertEqual(error.exception.code, 'guard_unavailable')
 
 
 if __name__ == '__main__': unittest.main()

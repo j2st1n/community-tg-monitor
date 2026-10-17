@@ -18,17 +18,17 @@ from datetime import datetime, timezone, timedelta
 
 try:
     from app.ai_classifier import (
-        AIClassificationError, OpenAICompatibleClassifier, clean_for_ai, normalize_chat_endpoint,
+        AIClassificationError, OpenAICompatibleClassifier, NodeSeekCascadeClassifier, clean_for_ai, normalize_chat_endpoint,
     )
 except ModuleNotFoundError:
     from ai_classifier import (
-        AIClassificationError, OpenAICompatibleClassifier, clean_for_ai, normalize_chat_endpoint,
+        AIClassificationError, OpenAICompatibleClassifier, NodeSeekCascadeClassifier, clean_for_ai, normalize_chat_endpoint,
     )
 
 try:
-    from app.participation import ContentPlanner, TopicPage, build_participant
+    from app.participation import ContentPlanner, TopicPage, build_participant, load_typesafe_key
 except ModuleNotFoundError:
-    from participation import ContentPlanner, TopicPage, build_participant
+    from participation import ContentPlanner, TopicPage, build_participant, load_typesafe_key
 
 try:
     from app.telegram_ui import TelegramUI, format_activity
@@ -94,12 +94,13 @@ DEFAULT_PRIVATE_INTERVAL = 45
 # 默认用户自定义关键词（初始为空，不启用；添加后享受最高优先级直通）
 DEFAULT_KEYWORDS = []
 
-# 精简后的 4 大核心指令
+# Telegram exposes daily queries and business switches only.
 BOT_COMMANDS = [
     {"command": "status", "description": "运行状态"},
-    {"command": "keywords", "description": "关注词"},
-    {"command": "sources", "description": "推送与自动参与"},
-    {"command": "signin", "description": "烧饼签到与查询"},
+    {"command": "signin", "description": "签到与资产"},
+    {"command": "report", "description": "今日汇总"},
+    {"command": "records", "description": "参与记录"},
+    {"command": "settings", "description": "设置"},
 ]
 
 LEGACY_BUILTIN_WORDS = {
@@ -418,7 +419,8 @@ class BotManager(TelegramUI):
             )
 
     def queue_nodeseek_post(self, unique_id, category, title, author, desc, link):
-        if unique_id in self.nodeseek_ai_pending or unique_id in self.nodeseek_ai_review:
+        if (unique_id in self.seen_ids or unique_id in self.nodeseek_ai_pending
+                or unique_id in self.nodeseek_ai_review):
             return False
         self.nodeseek_ai_pending[unique_id] = {
             "id": unique_id,
@@ -445,6 +447,10 @@ class BotManager(TelegramUI):
             self.ai_model,
             self.ai_judge_model,
         )
+
+    def build_nodeseek_classifier(self):
+        return NodeSeekCascadeClassifier(ContentPlanner(load_typesafe_key(), None).noul,
+                                         self.build_ai_classifier())
 
     def masked_ai_key(self):
         if not self.ai_api_key:
@@ -1067,33 +1073,34 @@ def deliver_public_match(bot, source_name, source_icon, category, title, author,
 
 
 def quarantine_nodeseek_ai_failure(bot, unique_id, record, now_ts):
-    """Keep exhausted posts for review without retrying or silently accepting them."""
-    bot.nodeseek_ai_review[unique_id] = {
+    """Close failures without retrying or creating another human-review task."""
+    bot.nodeseek_ai_history.append({
         "id": unique_id,
         "title": record.get("title", ""),
         "link": record.get("link", ""),
         "queued_at": record.get("queued_at"),
         "attempts": record.get("attempts", 0),
-        "last_error": record.get("last_error", ""),
-        "quarantined_at": now_ts,
-    }
+        "reason": "classification_unavailable",
+        "decision": "not_giveaway",
+        "error": "classification_unavailable",
+        "classified_at": now_ts,
+    })
     bot.nodeseek_ai_pending.pop(unique_id, None)
     bot.remember_seen_id(unique_id)
     bot.save_nodeseek_ai_state()
     bot.save_seen_ids()
     print(
-        f"[{datetime.now()}] ⚠️ NodeSeek AI 连续判定失败，转待人工复核: "
-        f"{record.get('title', '')} ({record.get('attempts', 0)} 次)",
+        f"[{datetime.now()}] ⚠️ NodeSeek AI 判定调用失败，已跳过（不重试）",
         flush=True,
     )
 
 
 def process_nodeseek_ai_queue(bot):
-    """Classify queued NodeSeek posts and quarantine exhausted retries."""
+    """Run the Jev/Gemini cascade and durably close each attempted item."""
     if not bot.ai_is_ready() or not bot.is_source_enabled("nodeseek"):
         return
     try:
-        classifier = bot.build_ai_classifier()
+        classifier = bot.build_nodeseek_classifier()
     except ValueError as exc:
         print(f"[{datetime.now()}] ⚠️ NodeSeek AI 配置无效: {exc}", flush=True)
         return
@@ -1123,24 +1130,15 @@ def process_nodeseek_ai_queue(bot):
         except (AIClassificationError, ValueError) as exc:
             attempts = int(record.get("attempts", 0)) + 1
             record["attempts"] = attempts
-            record["last_error"] = clean_for_ai(str(exc), 180)
             bot.record_stat("ai_errors")
-            if attempts >= MAX_AI_RETRY_ATTEMPTS:
-                quarantine_nodeseek_ai_failure(bot, unique_id, record, now_ts)
-                continue
-            retry_seconds = min(1800, 60 * (2 ** min(attempts - 1, 5)))
-            record["next_retry_at"] = now_ts + retry_seconds
-            bot.save_nodeseek_ai_state()
-            print(
-                f"[{datetime.now()}] ⚠️ NodeSeek AI 判定失败，{retry_seconds}s 后重试: "
-                f"{record.get('title', '')} ({record['last_error']})",
-                flush=True,
-            )
+            quarantine_nodeseek_ai_failure(bot, unique_id, record, now_ts)
             continue
 
         bot.record_stat("ai_classified")
         if result.get("reviewed"):
             bot.record_stat("ai_second_reviews")
+        if result.get("error"):
+            bot.record_stat("ai_errors")
         decision = result.get("decision")
         if decision == "giveaway":
             sub_type = result.get("sub_type") or "lottery"
@@ -1152,7 +1150,9 @@ def process_nodeseek_ai_queue(bot):
                 bot.record_stat("redpacket_hits")
             evidence = "；".join(result.get("evidence", [])[:2])
             default_reason = "AI 语义判定为有效抽奖" if sub_type == "lottery" else "AI 语义判定为有效福利活动"
-            reason = result.get("reason", default_reason)
+            reason = {"first_stage_allowed": "符合当前有效、免费权益、坛友受众及参与机制",
+                      "final_review_allowed": "原帖及引用依据支持参与或领取"}.get(
+                          result.get("reason"), result.get("reason", default_reason))
             if evidence:
                 reason = f"{reason}；证据：{evidence}"
             if not bot.paused:
@@ -1166,9 +1166,9 @@ def process_nodeseek_ai_queue(bot):
                     record.get("description", ""),
                     record.get("link", ""),
                     sub_type,
-                    f"AI 双阶段语义判定（置信度 {result.get('confidence', 0):.2f}）：{reason}",
+                    f"{'Gemini终审通过' if result.get('reviewed') else 'Jev初筛通过'}：{reason}",
                 )
-        elif decision == "uncertain":
+        elif decision == "uncertain" or result.get("reason") == "final_review_unclear":
             bot.record_stat("ai_uncertain")
 
         bot.nodeseek_ai_history.append({
@@ -1178,8 +1178,12 @@ def process_nodeseek_ai_queue(bot):
             "decision": decision,
             "sub_type": result.get("sub_type"),
             "confidence": result.get("confidence", 0),
+            "confidence_source": result.get("confidence_source", "jev_semantic_minimum"),
             "reason": result.get("reason", ""),
             "reviewed": bool(result.get("reviewed")),
+            "first_model": result.get("first_model", ""),
+            "final_model": result.get("final_model", ""),
+            "error": result.get("error", ""),
             "classified_at": int(time.time()),
         })
         bot.nodeseek_ai_pending.pop(unique_id, None)
@@ -1187,9 +1191,10 @@ def process_nodeseek_ai_queue(bot):
         bot.save_nodeseek_ai_state()
         bot.save_seen_ids()
         sub_type_label = f" ({result.get('sub_type')})" if result.get('sub_type') else ""
+        score_label = "Gemini终审" if result.get("reviewed") else "Jev初筛"
         print(
             f"[{datetime.now()}] 🧠 [NodeSeek AI] {decision}{sub_type_label} "
-            f"({result.get('confidence', 0):.2f}): {record.get('title', '')}",
+            f"({score_label}): {record.get('title', '')}",
             flush=True,
         )
 
@@ -1824,7 +1829,7 @@ def rss_monitor_thread(bot):
                                 "waiting": "已安排随机等待，轮到时会复查活动状态再参与。",
                                 "confirmed": "本程序提交后已核验本账号参与成功。",
                                 "query_confirmed": "已查到本账号参与，提交结果不明确，未归因为本程序。",
-                                "uncertain": "参与结果未确认，已保留预算；后台仅查询确认，不会重复提交。",
+                                "uncertain": "提交异常：尚未确认是否成功；后台仅查询确认，不会重复提交。",
                                 "manual_requirements": "已跳过：活动有程序无法满足的附加条件。",
                                 "final_review_denied": "已跳过：第二轮终审未通过。",
                                 "final_review_unclear": "已跳过：第二轮终审仍不明确。",
